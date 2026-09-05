@@ -47,6 +47,7 @@ cat >> "$tmp" <<'LUA'
 -- Super+J default is dwindle togglesplit — useless once windows are floating,
 -- maximized, or popped (the stacked mess on ultrawide / Surface Book). Rebind it.
 -- CLI: window-arrange   |   dry-run: window-arrange --dry-run
+-- Boot: window-arrange --on-start (waits for autostart apps, then arranges once)
 hl.unbind("SUPER + J")
 o.bind("SUPER + J", "Arrange windows (grid)", "window-arrange")
 o.bind("SUPER + ALT + A", "Arrange windows", "window-arrange")
@@ -54,7 +55,35 @@ o.bind("SUPER + ALT + A", "Arrange windows", "window-arrange")
 LUA
 mv "$tmp" "$BIND_FILE"
 
+# After Hyprland autostart apps map, run arrange once (quiet toast).
+AUTOSTART_FILE="${HOME}/.config/hypr/autostart.lua"
+mkdir -p "$(dirname "$AUTOSTART_FILE")"
+if [ ! -f "$AUTOSTART_FILE" ]; then
+  cat > "$AUTOSTART_FILE" <<'LUA'
+-- Extra autostart processes.
+LUA
+fi
+tmp="$(mktemp)"
+awk '
+  BEGIN { skip=0 }
+  /^-- window-arrange:begin$/ { skip=1; next }
+  /^-- window-arrange:end$/ { skip=0; next }
+  /^-- omarchy-rice:window-arrange-begin$/ { skip=1; next }
+  /^-- omarchy-rice:window-arrange-end$/ { skip=0; next }
+  skip==0 { print }
+' "$AUTOSTART_FILE" > "$tmp"
+cat >> "$tmp" <<'LUA'
+
+-- window-arrange:begin
+-- After autoload apps start, wait for a stable mapped set then arrange once.
+-- WINDOW_ARRANGE_NOTIFY defaults to 0 in --on-start (no boot toast).
+o.exec_on_start("window-arrange --on-start")
+-- window-arrange:end
+LUA
+mv "$tmp" "$AUTOSTART_FILE"
+
 if command -v hyprctl >/dev/null 2>&1 && [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then
+  # Omarchy/Hyprland 0.56 rejects legacy keyword reload; eval reload is fine.
   hyprctl reload config-only >/dev/null 2>&1 \
     || hyprctl reload >/dev/null 2>&1 \
     || true
@@ -63,6 +92,8 @@ fi
 echo "Installed: ${BIN_DIR}/window-arrange"
 echo "Layout:    ${SHARE_DIR}/layout.py"
 echo "Hotkeys:   Super+J  and  Super+Alt+A  (Mac host: Super+Option+J / A)"
+echo "Autostart: window-arrange --on-start  (via ~/.config/hypr/autostart.lua)"
 echo "Run:       window-arrange"
 echo "Dry-run:   window-arrange --dry-run"
+echo "Boot wait: window-arrange --on-start"
 echo "Tests:     python3 -m unittest tests.test_layout -v"
