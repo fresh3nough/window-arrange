@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # window-arrange — tidy every mapped window on the active workspace.
 #
+# Fast path (no thrash):
+#   1. One layout plan (layout.py, logical pixels / HiDPI-aware)
+#   2. One hyprctl clients snapshot
+#   3. One hyprctl --batch of address-targeted dispatches
+#   → windows jump once to final cells. No focus cycling, no sleeps,
+#     no verify/retry loops (those were the multi-second lag with 5+ windows).
+#
 # Omarchy-style layout (not fullscreen / not edge-to-edge chrome):
-#   - Exit fullscreen / maximized on every window (bar + wallpaper stay visible)
-#   - Plan geometry in *logical* pixels (physical / monitor scale) so HiDPI
-#     and scale-1.0 machines share the same visual density
-#   - Integer-split grid with gutters so cells never share pixels
-#   - scrcpy / Pixel → compact floating portrait strip on the right
+#   - Exit fullscreen / maximized so the top bar + wallpaper stay visible
+#   - Integer-split grid with gutters; scrcpy/Pixel → right portrait strip
 #
 # Usage:
 #   window-arrange           # apply
@@ -17,220 +21,194 @@
 #   WINDOW_ARRANGE_OUTER=16
 #   WINDOW_ARRANGE_PHONE_W=360
 #   WINDOW_ARRANGE_PHONE_H=800
-#   WINDOW_ARRANGE_ADAPT=1    # 0 = fixed defaults above, still logical geometry
+#   WINDOW_ARRANGE_ADAPT=1       # 0 = fixed defaults above, still logical geometry
+#   WINDOW_ARRANGE_NOTIFY=1      # 0 = silence toast (boot restore)
+#   WINDOW_ARRANGE_ANIM=0        # 1 = leave animations on (default off for instant place)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Prefer alongside the script (repo / install copy next to layout.py).
 LAYOUT_PY=""
 for candidate in \
   "${ROOT}/layout.py" \
   "${HOME}/.local/share/window-arrange/layout.py" \
   "${HOME}/.local/bin/layout.py"
 do
-  if [ -f "$candidate" ]; then
-    LAYOUT_PY="$candidate"
+  if [[ -f $candidate ]]; then
+    LAYOUT_PY=$candidate
     break
   fi
 done
-if [ -z "$LAYOUT_PY" ]; then
+if [[ -z $LAYOUT_PY ]]; then
   echo "window-arrange: layout.py not found next to script or under ~/.local" >&2
   exit 1
 fi
 
-GAP="${WINDOW_ARRANGE_GAP:-}"
-OUTER="${WINDOW_ARRANGE_OUTER:-}"
-PHONE_W="${WINDOW_ARRANGE_PHONE_W:-}"
-PHONE_H="${WINDOW_ARRANGE_PHONE_H:-}"
+GAP=${WINDOW_ARRANGE_GAP:-}
+OUTER=${WINDOW_ARRANGE_OUTER:-}
+PHONE_W=${WINDOW_ARRANGE_PHONE_W:-}
+PHONE_H=${WINDOW_ARRANGE_PHONE_H:-}
 DRY=0
-[[ "${1:-}" == "--dry-run" || "${1:-}" == "-n" ]] && DRY=1
+[[ ${1:-} == "--dry-run" || ${1:-} == "-n" ]] && DRY=1
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
 need hyprctl
 need python3
 
-dispatch() {
-  local lua="$1"
-  shift
-  if [ "$DRY" -eq 1 ]; then
-    return 0
-  fi
-  hyprctl dispatch "$lua" >/dev/null 2>&1 || {
-    [ "$#" -gt 0 ] && hyprctl dispatch "$@" >/dev/null 2>&1 || true
-  }
-}
-
-# Exit every fullscreen / maximized mode Hyprland exposes for this window.
-exit_fullscreen() {
-  local window="$1"
-  dispatch "hl.dsp.focus({ window = \"$window\" })" focuswindow "$window"
-  # mode 0 = off; try Lua path then legacy dispatchers used across builds.
-  dispatch "hl.dsp.window.fullscreen({ mode = \"0\" })" fullscreen 0
-  hyprctl dispatch fullscreen 0 >/dev/null 2>&1 || true
-  hyprctl dispatch fullscreenstate 0 0 >/dev/null 2>&1 || true
-  # Some clients (e.g. allowedOverFullscreen) need a second tick.
-  sleep 0.06
-  hyprctl dispatch fullscreenstate 0 0 >/dev/null 2>&1 || true
-}
-
-# Snapshot workspace → JSON plan (one object per line), logical coordinates.
-PLAN="$(
-  GAP="$GAP" OUTER="$OUTER" PHONE_W="$PHONE_W" PHONE_H="$PHONE_H" \
-  WINDOW_ARRANGE_ADAPT="${WINDOW_ARRANGE_ADAPT:-1}" \
+# Snapshot workspace → JSON lines (one object per window).
+PLAN=$(
+  GAP=$GAP OUTER=$OUTER PHONE_W=$PHONE_W PHONE_H=$PHONE_H \
+  WINDOW_ARRANGE_ADAPT=${WINDOW_ARRANGE_ADAPT:-1} \
   python3 "$LAYOUT_PY"
-)" || true
+) || true
 
-if [ -z "${PLAN}" ]; then
+if [[ -z ${PLAN} ]]; then
   echo "window-arrange: nothing to layout on this workspace" >&2
   exit 0
 fi
 
-apply_one() {
-  local addr="$1" cls="$2" role="$3" mode="$4"
-  local x="$5" y="$6" w="$7" h="$8"
-  local was_fs="$9" was_floating="${10}" was_pinned="${11}"
-  local window="address:${addr}"
-
-  if [ "$DRY" -eq 1 ]; then
-    printf 'PLAN %s %-12s %s → %dx%d @ %d,%d%s%s\n' \
-      "$role" "$cls" "$mode" "$w" "$h" "$x" "$y" \
-      "$([ "$was_fs" = "True" ] || [ "$was_fs" = "true" ] || [ "$was_fs" = "1" ] || [ "$was_fs" = "2" ] && echo ' [exit-fullscreen]' || true)" \
-      "$([ "$was_pinned" = "True" ] || [ "$was_pinned" = "true" ] && echo ' [unpin]' || true)"
-    return 0
-  fi
-
-  # 1) Always leave fullscreen / maximized so the Omarchy bar + wallpaper show.
-  #    Re-check live state: plan snapshot can race a client that re-fs itself.
-  exit_fullscreen "$window"
-
-  # 2) Unpin pop-outs so they can move/resize.
-  if [ "$was_pinned" = "True" ] || [ "$was_pinned" = "true" ]; then
-    dispatch "hl.dsp.window.pin({ window = \"$window\" })" pin "$window"
-  fi
-
-  # 3) Ensure floating for placed layout (even cells with padding).
-  local live_floating
-  live_floating="$(hyprctl clients -j | python3 -c "
-import json,sys
-a='$addr'
-for c in json.load(sys.stdin):
-  if c.get('address')==a:
-    print('1' if c.get('floating') else '0')
-    break
-else:
-  print('0')
-" 2>/dev/null || echo 0)"
-  if [ "$live_floating" != "1" ]; then
-    dispatch "hl.dsp.window.float({ window = \"$window\", action = \"toggle\" })" \
-      togglefloating "$window"
-  fi
-
-  dispatch "hl.dsp.focus({ window = \"$window\" })" focuswindow "$window"
-  # Resize then move; also try resizewindowpixel which addresses by window.
-  dispatch "hl.dsp.window.resize({ window = \"$window\", x = $w, y = $h })" \
-    resizeactive exact "$w" "$h"
-  hyprctl dispatch resizewindowpixel exact "$w" "$h","$window" >/dev/null 2>&1 || true
-  dispatch "hl.dsp.window.move({ window = \"$window\", x = $x, y = $y })" \
-    moveactive exact "$x" "$y"
-  hyprctl dispatch movewindowpixel exact "$x" "$y","$window" >/dev/null 2>&1 || true
-
-  hyprctl dispatch "hl.dsp.window.tag({ window = \"$window\", tag = \"-pop\" })" >/dev/null 2>&1 || true
-
-  sleep 0.05
-  # Verify + retry (fullscreen can stick on allowedOverFullscreen clients).
-  local attempt got gx gy gw gh gfs
-  for attempt in 1 2 3; do
-    got="$(hyprctl clients -j | python3 -c "
-import json,sys
-a='$addr'
-for c in json.load(sys.stdin):
-  if c.get('address')==a:
-    fs=c.get('fullscreen') or 0
-    try: fs=int(fs)
-    except Exception: fs=1 if fs else 0
-    print(c['at'][0], c['at'][1], c['size'][0], c['size'][1], fs)
-    break
-" 2>/dev/null || true)"
-    read -r gx gy gw gh gfs <<<"${got:-0 0 0 0 0}"
-    if [ "${gfs:-0}" != "0" ]; then
-      exit_fullscreen "$window"
-    fi
-    # Geometry off by >12px, or still larger than planned (min-size clamp): re-apply.
-    if [ $((gx < x - 12 || gx > x + 12 || gy < y - 12 || gy > y + 12 || gw < w - 12 || gw > w + 12 || gh < h - 12 || gh > h + 12)) -eq 1 ]; then
-      dispatch "hl.dsp.focus({ window = \"$window\" })" focuswindow "$window"
-      hyprctl dispatch resizewindowpixel exact "$w" "$h","$window" >/dev/null 2>&1 || \
-        dispatch "hl.dsp.window.resize({ window = \"$window\", x = $w, y = $h })" \
-          resizeactive exact "$w" "$h"
-      hyprctl dispatch movewindowpixel exact "$x" "$y","$window" >/dev/null 2>&1 || \
-        dispatch "hl.dsp.window.move({ window = \"$window\", x = $x, y = $y })" \
-          moveactive exact "$x" "$y"
-      sleep 0.05
-    else
-      break
-    fi
-  done
-
-  printf 'OK %s %-12s → %dx%d @ %d,%d\n' "$role" "$cls" "$w" "$h" "$x" "$y"
-}
-
-count=0
-while IFS= read -r line; do
-  [ -z "$line" ] && continue
-  eval "$(printf '%s' "$line" | python3 -c '
-import json,sys,shlex
-o=json.load(sys.stdin)
-def q(s): return shlex.quote(str(s))
-print("addr=%s cls=%s role=%s mode=%s x=%s y=%s w=%s h=%s was_fs=%s was_floating=%s was_pinned=%s" % (
-  q(o["address"]), q(o["class"]), q(o["role"]), q(o["mode"]),
-  q(o["x"]), q(o["y"]), q(o["w"]), q(o["h"]),
-  q(o.get("fullscreen", False)), q(o.get("floating", False)), q(o.get("pinned", False)),
-))
-')"
-  apply_one "$addr" "$cls" "$role" "$mode" "$x" "$y" "$w" "$h" "$was_fs" "$was_floating" "$was_pinned"
-  count=$((count + 1))
-done <<< "$PLAN"
-
-# Second pass: if any planned pair would still overlap live, nudge by re-applying plan.
-if [ "$DRY" -eq 0 ] && [ "$count" -gt 0 ]; then
-  python3 - "$PLAN" <<'PY' 2>/dev/null || true
-import json, subprocess, sys
-plan = [json.loads(l) for l in sys.argv[1].splitlines() if l.strip()]
-clients = {c["address"]: c for c in json.loads(subprocess.check_output(["hyprctl", "clients", "-j"], text=True))}
-bad = False
-for p in plan:
-    c = clients.get(p["address"])
-    if not c:
+if (( DRY == 1 )); then
+  printf '%s\n' "$PLAN" | python3 -c '
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
         continue
-    if int(c.get("fullscreen") or 0):
-        bad = True
-    at, sz = c["at"], c["size"]
-    if abs(at[0]-p["x"])>24 or abs(at[1]-p["y"])>24 or abs(sz[0]-p["w"])>40 or abs(sz[1]-p["h"])>40:
-        bad = True
-if bad:
-    # Caller already printed OK lines; a quiet re-hit helps sticky fullscreen.
-    for p in plan:
-        w = f'address:{p["address"]}'
-        subprocess.call(["hyprctl", "dispatch", "focuswindow", w], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.call(["hyprctl", "dispatch", "fullscreenstate", "0", "0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.call(["hyprctl", "dispatch", f'resizewindowpixel', f'exact', f'{p["w"]}', f'{p["h"]},{w}'],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.call(["hyprctl", "dispatch", f'movewindowpixel', f'exact', f'{p["x"]}', f'{p["y"]},{w}'],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-PY
+    o = json.loads(line)
+    extra = []
+    if o.get("fullscreen") not in (0, False, None):
+        extra.append("exit-fs")
+    if o.get("pinned"):
+        extra.append("unpin")
+    tag = (" [" + ", ".join(extra) + "]") if extra else ""
+    print(
+        "PLAN %s %-12s → %dx%d @ %d,%d%s"
+        % (o["role"], o["class"], o["w"], o["h"], o["x"], o["y"], tag)
+    )
+'
+  exit 0
 fi
 
-if [ "$DRY" -eq 0 ] && [ "$count" -gt 0 ] && [ "${WINDOW_ARRANGE_NOTIFY:-1}" != "0" ]; then
-  # -g must be a single icon glyph (Nerd Font), never a word — words render as
-  # overlapping garbage in the upper-right notification toast.
+# Build + fire a single batch. All geometry is address-targeted so we never
+# focus-cycle (focus thrash is what looked like "random movement").
+RESULT=$(
+  PLAN=$PLAN \
+  WINDOW_ARRANGE_ANIM=${WINDOW_ARRANGE_ANIM:-0} \
+  python3 - <<'PY'
+import json, os, subprocess, sys, time
+
+plan = [json.loads(l) for l in os.environ["PLAN"].splitlines() if l.strip()]
+if not plan:
+    print("count=0")
+    sys.exit(0)
+
+# One clients snapshot for floating/fullscreen/pinned state.
+try:
+    clients = {
+        c["address"]: c
+        for c in json.loads(
+            subprocess.check_output(["hyprctl", "clients", "-j"], text=True)
+        )
+    }
+except Exception as e:
+    print(f"error=clients:{e}", file=sys.stderr)
+    clients = {}
+
+anim_off = os.environ.get("WINDOW_ARRANGE_ANIM", "0") != "1"
+batch: list[str] = []
+
+def add(cmd: str) -> None:
+    batch.append(cmd)
+
+if anim_off:
+    # Instant place; restored at end of batch.
+    add("keyword animation windows,0")
+    add("keyword animation layers,0")
+    add("keyword animation fade,0")
+    add("keyword animation border,0")
+
+for p in plan:
+    addr = p["address"]
+    win = f"address:{addr}"
+    live = clients.get(addr, {})
+    fs = live.get("fullscreen", p.get("fullscreen") or 0)
+    try:
+        fs_i = int(fs)
+    except Exception:
+        fs_i = 1 if fs else 0
+    floating = bool(live.get("floating", p.get("floating")))
+    pinned = bool(live.get("pinned", p.get("pinned")))
+
+    # Fullscreen off without focusing (state dispatch is global-on-active on
+    # some builds, so prefer window-scoped Lua form first; batch both).
+    if fs_i:
+        add(f"dispatch fullscreenstate 0 0 {win}")
+        # Fallback used by older parsers that ignore the address suffix:
+        add(f"dispatch focuswindow {win}")
+        add("dispatch fullscreenstate 0 0")
+
+    if pinned:
+        add(f"dispatch pin {win}")
+
+    if not floating:
+        add(f"dispatch togglefloating {win}")
+
+    # Address-targeted geometry — NO focuswindow before move/resize.
+    # resizewindowpixel / movewindowpixel take "exact W H,address:0x…"
+    w, h, x, y = int(p["w"]), int(p["h"]), int(p["x"]), int(p["y"])
+    add(f"dispatch resizewindowpixel exact {w} {h},{win}")
+    add(f"dispatch movewindowpixel exact {x} {y},{win}")
+
+    # Drop pop tag if present (ignore failures inside batch).
+    add(f"dispatch tagwindow -pop {win}")
+
+if anim_off:
+    add("keyword animation windows,1")
+    add("keyword animation layers,1")
+    add("keyword animation fade,1")
+    add("keyword animation border,1")
+
+batch_body = " ; ".join(batch)
+t0 = time.monotonic()
+# hyprctl --batch runs the chain in one IPC round-trip.
+proc = subprocess.run(
+    ["hyprctl", "--batch", batch_body],
+    text=True,
+    capture_output=True,
+)
+dt = (time.monotonic() - t0) * 1000
+
+# Print per-window summary from the plan (final targets, not live thrash).
+for p in plan:
+    print(
+        f"OK {p['role']} {p.get('class', ''):<12} → {p['w']}x{p['h']} @ {p['x']},{p['y']}"
+    )
+
+print(f"count={len(plan)}")
+print(f"ms={dt:.0f}")
+print(f"batch_rc={proc.returncode}")
+if proc.returncode != 0 and proc.stderr.strip():
+    # Non-fatal: some tag/anim keywords may 404 on minimal builds.
+    err = proc.stderr.strip().replace("\n", " | ")
+    print(f"batch_err={err[:300]}", file=sys.stderr)
+PY
+) || true
+
+printf '%s\n' "$RESULT"
+
+count=$(printf '%s\n' "$RESULT" | sed -n 's/^count=//p' | tail -1)
+count=${count:-0}
+
+if (( count > 0 )) && [[ ${WINDOW_ARRANGE_NOTIFY:-1} != 0 ]]; then
+  # -g must be a single Nerd Font glyph — never a word (words render as junk).
   if command -v omarchy-notification-send >/dev/null 2>&1; then
     omarchy-notification-send \
       --app-name window-arrange \
       -g "󰕰" \
-      -t 2500 \
+      -t 1800 \
       "Arranged $count windows" \
-      "Grid · bar stays visible" 2>/dev/null || true
+      "Instant grid" 2>/dev/null || true
   elif command -v notify-send >/dev/null 2>&1; then
-    notify-send -a window-arrange -t 2500 "Arranged $count windows" "Grid · bar stays visible" 2>/dev/null || true
+    notify-send -a window-arrange -t 1800 "Arranged $count windows" "Instant grid" 2>/dev/null || true
   fi
 fi
 

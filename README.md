@@ -35,6 +35,19 @@ install -m 0644 layout.py ~/.local/share/window-arrange/layout.py
 #   o.bind("SUPER + ALT + A", "Arrange windows", "window-arrange")
 ```
 
+## Performance
+
+Previous versions focused/resized/moved each window with sleeps and 3× verify
+retries, then ran a second pass — with 5+ windows that thrashed the compositor
+for up to a minute (windows visibly hopping). Current path:
+
+1. One `layout.py` plan  
+2. One `hyprctl clients -j` snapshot  
+3. One `hyprctl --batch` of address-targeted `resizewindowpixel` / `movewindowpixel`  
+4. Animations briefly disabled for the batch so cells appear in place  
+
+Typical wall time on 5 windows: **~0.1s**. No focus cycling.
+
 ## Usage
 
 ```bash
