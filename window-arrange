@@ -219,7 +219,7 @@ if bad:
 PY
 fi
 
-if [ "$DRY" -eq 0 ] && [ "$count" -gt 0 ]; then
+if [ "$DRY" -eq 0 ] && [ "$count" -gt 0 ] && [ "${WINDOW_ARRANGE_NOTIFY:-1}" != "0" ]; then
   # -g must be a single icon glyph (Nerd Font), never a word — words render as
   # overlapping garbage in the upper-right notification toast.
   if command -v omarchy-notification-send >/dev/null 2>&1; then
