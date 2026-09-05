@@ -19,7 +19,9 @@ cd window-arrange
 bash install.sh
 ```
 
-`install.sh` puts the binary and `layout.py` on `~/.local/bin` (and a copy under `~/.local/share/window-arrange`) and binds **Super+Alt+A**.
+`install.sh` puts the binary and `layout.py` on `~/.local/bin` (and a copy under `~/.local/share/window-arrange`), rebinds **Super+J** (replaces dwindle togglesplit), and binds **Super+Alt+A**.
+
+Why Super+J: default Omarchy `togglesplit` only flips already-tiled dwindle leaves. Floated / popped / maximized windows ignore it and keep stacking — the usual ultrawide / Surface Book mess. Arrange always re-packs the free work area as a responsive grid instead.
 
 Manual:
 
@@ -27,7 +29,9 @@ Manual:
 install -m 0755 window-arrange ~/.local/bin/window-arrange
 install -m 0644 layout.py ~/.local/bin/layout.py
 install -m 0644 layout.py ~/.local/share/window-arrange/layout.py
-# optional hotkey in ~/.config/hypr/bindings.lua:
+# optional hotkeys in ~/.config/hypr/bindings.lua:
+#   hl.unbind("SUPER + J")
+#   o.bind("SUPER + J", "Arrange windows (grid)", "window-arrange")
 #   o.bind("SUPER + ALT + A", "Arrange windows", "window-arrange")
 ```
 
@@ -40,7 +44,8 @@ window-arrange --dry-run    # print plan only
 
 | Action | Shortcut | On a Mac host |
 |--------|----------|----------------|
-| Arrange windows | **Super+Alt+A** | **Cmd+Opt+A** |
+| Arrange windows (grid) | **Super+J** | **Super+Option+J** |
+| Arrange windows (alias) | **Super+Alt+A** | **Super+Option+A** |
 
 ## Environment
 
