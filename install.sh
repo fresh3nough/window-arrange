@@ -5,7 +5,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${HOME}/.local/bin"
-mkdir -p "$BIN_DIR"
+SHARE_DIR="${HOME}/.local/share/window-arrange"
+mkdir -p "$BIN_DIR" "$SHARE_DIR"
+
+# layout.py must sit next to the launcher (or under share/) for logical planning.
+install -m 0644 "${ROOT}/layout.py" "${SHARE_DIR}/layout.py"
+install -m 0644 "${ROOT}/layout.py" "${BIN_DIR}/layout.py"
 install -m 0755 "${ROOT}/window-arrange" "${BIN_DIR}/window-arrange"
 
 # Ensure ~/.local/bin is on PATH for this shell and future logins
@@ -36,6 +41,7 @@ cat >> "$tmp" <<'LUA'
 
 -- window-arrange:begin
 -- Auto-arrange windows: padded grid + scrcpy phone strip. Bar & wallpaper stay visible.
+-- Geometry is planned in Hyprland logical pixels (physical / scale) for HiDPI + scale-1.
 -- CLI: window-arrange   |   dry-run: window-arrange --dry-run
 o.bind("SUPER + ALT + A", "Arrange windows", "window-arrange")
 -- window-arrange:end
@@ -49,6 +55,8 @@ if command -v hyprctl >/dev/null 2>&1 && [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}"
 fi
 
 echo "Installed: ${BIN_DIR}/window-arrange"
-echo "Hotkey:    Super+Alt+A  (Mac host: ⌘⌥A)"
+echo "Layout:    ${SHARE_DIR}/layout.py"
+echo "Hotkey:    Super+Alt+A  (Mac host: Cmd+Opt+A)"
 echo "Run:       window-arrange"
 echo "Dry-run:   window-arrange --dry-run"
+echo "Tests:     python3 -m unittest tests.test_layout -v"
