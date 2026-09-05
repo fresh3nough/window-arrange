@@ -220,10 +220,17 @@ PY
 fi
 
 if [ "$DRY" -eq 0 ] && [ "$count" -gt 0 ]; then
+  # -g must be a single icon glyph (Nerd Font), never a word — words render as
+  # overlapping garbage in the upper-right notification toast.
   if command -v omarchy-notification-send >/dev/null 2>&1; then
-    omarchy-notification-send -g "Arranged" "Arranged $count windows" "Padded grid · bar & wallpaper visible" 2>/dev/null || true
+    omarchy-notification-send \
+      --app-name window-arrange \
+      -g "󰕰" \
+      -t 2500 \
+      "Arranged $count windows" \
+      "Grid · bar stays visible" 2>/dev/null || true
   elif command -v notify-send >/dev/null 2>&1; then
-    notify-send -a window-arrange "Arranged $count windows" 2>/dev/null || true
+    notify-send -a window-arrange -t 2500 "Arranged $count windows" "Grid · bar stays visible" 2>/dev/null || true
   fi
 fi
 
