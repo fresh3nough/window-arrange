@@ -5,7 +5,7 @@
 #   - Exit fullscreen / maximized on every window (bar + wallpaper stay visible)
 #   - Plan geometry in *logical* pixels (physical / monitor scale) so HiDPI
 #     and scale-1.0 machines share the same visual density
-#   - Non-phone apps → even floating grid with outer padding
+#   - Integer-split grid with gutters so cells never share pixels
 #   - scrcpy / Pixel → compact floating portrait strip on the right
 #
 # Usage:
@@ -13,8 +13,8 @@
 #   window-arrange --dry-run # print plan only
 #
 # Env knobs (all optional; unset = adaptive from logical work area):
-#   WINDOW_ARRANGE_GAP=8
-#   WINDOW_ARRANGE_OUTER=12
+#   WINDOW_ARRANGE_GAP=12
+#   WINDOW_ARRANGE_OUTER=16
 #   WINDOW_ARRANGE_PHONE_W=360
 #   WINDOW_ARRANGE_PHONE_H=800
 #   WINDOW_ARRANGE_ADAPT=1    # 0 = fixed defaults above, still logical geometry
@@ -60,6 +60,19 @@ dispatch() {
   }
 }
 
+# Exit every fullscreen / maximized mode Hyprland exposes for this window.
+exit_fullscreen() {
+  local window="$1"
+  dispatch "hl.dsp.focus({ window = \"$window\" })" focuswindow "$window"
+  # mode 0 = off; try Lua path then legacy dispatchers used across builds.
+  dispatch "hl.dsp.window.fullscreen({ mode = \"0\" })" fullscreen 0
+  hyprctl dispatch fullscreen 0 >/dev/null 2>&1 || true
+  hyprctl dispatch fullscreenstate 0 0 >/dev/null 2>&1 || true
+  # Some clients (e.g. allowedOverFullscreen) need a second tick.
+  sleep 0.06
+  hyprctl dispatch fullscreenstate 0 0 >/dev/null 2>&1 || true
+}
+
 # Snapshot workspace → JSON plan (one object per line), logical coordinates.
 PLAN="$(
   GAP="$GAP" OUTER="$OUTER" PHONE_W="$PHONE_W" PHONE_H="$PHONE_H" \
@@ -81,18 +94,14 @@ apply_one() {
   if [ "$DRY" -eq 1 ]; then
     printf 'PLAN %s %-12s %s → %dx%d @ %d,%d%s%s\n' \
       "$role" "$cls" "$mode" "$w" "$h" "$x" "$y" \
-      "$([ "$was_fs" = "True" ] || [ "$was_fs" = "true" ] && echo ' [exit-fullscreen]' || true)" \
+      "$([ "$was_fs" = "True" ] || [ "$was_fs" = "true" ] || [ "$was_fs" = "1" ] || [ "$was_fs" = "2" ] && echo ' [exit-fullscreen]' || true)" \
       "$([ "$was_pinned" = "True" ] || [ "$was_pinned" = "true" ] && echo ' [unpin]' || true)"
     return 0
   fi
 
   # 1) Always leave fullscreen / maximized so the Omarchy bar + wallpaper show.
-  if [ "$was_fs" = "True" ] || [ "$was_fs" = "true" ] || [ "$was_fs" = "1" ] || [ "$was_fs" = "2" ]; then
-    dispatch "hl.dsp.focus({ window = \"$window\" })" focuswindow "$window"
-    dispatch "hl.dsp.window.fullscreen({ mode = \"0\" })" fullscreen 0
-    hyprctl dispatch fullscreenstate 0 0 >/dev/null 2>&1 || true
-    sleep 0.05
-  fi
+  #    Re-check live state: plan snapshot can race a client that re-fs itself.
+  exit_fullscreen "$window"
 
   # 2) Unpin pop-outs so they can move/resize.
   if [ "$was_pinned" = "True" ] || [ "$was_pinned" = "true" ]; then
@@ -100,42 +109,66 @@ apply_one() {
   fi
 
   # 3) Ensure floating for placed layout (even cells with padding).
-  if [ "$was_floating" != "True" ] && [ "$was_floating" != "true" ]; then
+  local live_floating
+  live_floating="$(hyprctl clients -j | python3 -c "
+import json,sys
+a='$addr'
+for c in json.load(sys.stdin):
+  if c.get('address')==a:
+    print('1' if c.get('floating') else '0')
+    break
+else:
+  print('0')
+" 2>/dev/null || echo 0)"
+  if [ "$live_floating" != "1" ]; then
     dispatch "hl.dsp.window.float({ window = \"$window\", action = \"toggle\" })" \
       togglefloating "$window"
   fi
 
   dispatch "hl.dsp.focus({ window = \"$window\" })" focuswindow "$window"
+  # Resize then move; also try resizewindowpixel which addresses by window.
   dispatch "hl.dsp.window.resize({ window = \"$window\", x = $w, y = $h })" \
     resizeactive exact "$w" "$h"
+  hyprctl dispatch resizewindowpixel exact "$w" "$h","$window" >/dev/null 2>&1 || true
   dispatch "hl.dsp.window.move({ window = \"$window\", x = $x, y = $y })" \
     moveactive exact "$x" "$y"
+  hyprctl dispatch movewindowpixel exact "$x" "$y","$window" >/dev/null 2>&1 || true
 
   hyprctl dispatch "hl.dsp.window.tag({ window = \"$window\", tag = \"-pop\" })" >/dev/null 2>&1 || true
 
-  sleep 0.04
-  # Verify + one retry
-  local got gx gy gw gh
-  got="$(hyprctl clients -j | python3 -c "
+  sleep 0.05
+  # Verify + retry (fullscreen can stick on allowedOverFullscreen clients).
+  local attempt got gx gy gw gh gfs
+  for attempt in 1 2 3; do
+    got="$(hyprctl clients -j | python3 -c "
 import json,sys
 a='$addr'
 for c in json.load(sys.stdin):
   if c.get('address')==a:
-    print(c['at'][0], c['at'][1], c['size'][0], c['size'][1], int(bool(c.get('fullscreen'))))
+    fs=c.get('fullscreen') or 0
+    try: fs=int(fs)
+    except Exception: fs=1 if fs else 0
+    print(c['at'][0], c['at'][1], c['size'][0], c['size'][1], fs)
     break
 " 2>/dev/null || true)"
-  read -r gx gy gw gh gfs <<<"${got:-0 0 0 0 0}"
-  if [ "${gfs:-0}" != "0" ]; then
-    dispatch "hl.dsp.focus({ window = \"$window\" })"
-    dispatch "hl.dsp.window.fullscreen({ mode = \"0\" })" fullscreen 0
-    hyprctl dispatch fullscreenstate 0 0 >/dev/null 2>&1 || true
-  fi
-  if [ -n "${gx:-}" ] && { [ "$gx" != "0" ] || [ "${gy:-0}" != "0" ]; }; then
-    if [ $((gx < x - 20 || gx > x + 20 || gy < y - 20 || gy > y + 20 || gw < w - 20 || gw > w + 20 || gh < h - 20 || gh > h + 20)) -eq 1 ]; then
-      dispatch "hl.dsp.window.resize({ window = \"$window\", x = $w, y = $h })"
-      dispatch "hl.dsp.window.move({ window = \"$window\", x = $x, y = $y })"
+    read -r gx gy gw gh gfs <<<"${got:-0 0 0 0 0}"
+    if [ "${gfs:-0}" != "0" ]; then
+      exit_fullscreen "$window"
     fi
-  fi
+    # Geometry off by >12px, or still larger than planned (min-size clamp): re-apply.
+    if [ $((gx < x - 12 || gx > x + 12 || gy < y - 12 || gy > y + 12 || gw < w - 12 || gw > w + 12 || gh < h - 12 || gh > h + 12)) -eq 1 ]; then
+      dispatch "hl.dsp.focus({ window = \"$window\" })" focuswindow "$window"
+      hyprctl dispatch resizewindowpixel exact "$w" "$h","$window" >/dev/null 2>&1 || \
+        dispatch "hl.dsp.window.resize({ window = \"$window\", x = $w, y = $h })" \
+          resizeactive exact "$w" "$h"
+      hyprctl dispatch movewindowpixel exact "$x" "$y","$window" >/dev/null 2>&1 || \
+        dispatch "hl.dsp.window.move({ window = \"$window\", x = $x, y = $y })" \
+          moveactive exact "$x" "$y"
+      sleep 0.05
+    else
+      break
+    fi
+  done
 
   printf 'OK %s %-12s → %dx%d @ %d,%d\n' "$role" "$cls" "$w" "$h" "$x" "$y"
 }
@@ -156,6 +189,35 @@ print("addr=%s cls=%s role=%s mode=%s x=%s y=%s w=%s h=%s was_fs=%s was_floating
   apply_one "$addr" "$cls" "$role" "$mode" "$x" "$y" "$w" "$h" "$was_fs" "$was_floating" "$was_pinned"
   count=$((count + 1))
 done <<< "$PLAN"
+
+# Second pass: if any planned pair would still overlap live, nudge by re-applying plan.
+if [ "$DRY" -eq 0 ] && [ "$count" -gt 0 ]; then
+  python3 - "$PLAN" <<'PY' 2>/dev/null || true
+import json, subprocess, sys
+plan = [json.loads(l) for l in sys.argv[1].splitlines() if l.strip()]
+clients = {c["address"]: c for c in json.loads(subprocess.check_output(["hyprctl", "clients", "-j"], text=True))}
+bad = False
+for p in plan:
+    c = clients.get(p["address"])
+    if not c:
+        continue
+    if int(c.get("fullscreen") or 0):
+        bad = True
+    at, sz = c["at"], c["size"]
+    if abs(at[0]-p["x"])>24 or abs(at[1]-p["y"])>24 or abs(sz[0]-p["w"])>40 or abs(sz[1]-p["h"])>40:
+        bad = True
+if bad:
+    # Caller already printed OK lines; a quiet re-hit helps sticky fullscreen.
+    for p in plan:
+        w = f'address:{p["address"]}'
+        subprocess.call(["hyprctl", "dispatch", "focuswindow", w], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.call(["hyprctl", "dispatch", "fullscreenstate", "0", "0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.call(["hyprctl", "dispatch", f'resizewindowpixel', f'exact', f'{p["w"]}', f'{p["h"]},{w}'],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.call(["hyprctl", "dispatch", f'movewindowpixel', f'exact', f'{p["x"]}', f'{p["y"]},{w}'],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+PY
+fi
 
 if [ "$DRY" -eq 0 ] && [ "$count" -gt 0 ]; then
   if command -v omarchy-notification-send >/dev/null 2>&1; then

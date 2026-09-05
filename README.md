@@ -4,8 +4,8 @@ Omarchy / Hyprland helper that tidies every window on the **active workspace**.
 
 - **Not fullscreen** — exits maximized/fullscreen first so the Omarchy top bar (clock, shortcuts) and desktop wallpaper stay visible
 - **Logical geometry** — plans in Hyprland logical pixels (`physical / scale`) so HiDPI panels and scale-1.0 screens share the same density
-- **Adaptive padding** — gap / outer / phone strip scale gently with the logical work area (override with env vars)
-- **Even grid** for normal apps
+- **Adaptive padding** — roomier gap/outer (~12/16 at reference density); override with env vars
+- **Even non-overlapping grid** — integer-split cells with true gutters; prefers browser-safe widths so min-size clamps cannot stack windows
 - **scrcpy / Pixel** stays a compact portrait strip on the right
 - Works with Hyprland 0.56+ Lua dispatchers (`hl.dsp.window.*`)
 
@@ -46,12 +46,11 @@ window-arrange --dry-run    # print plan only
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `WINDOW_ARRANGE_GAP` | adaptive (~8) | Gap between grid cells |
-| `WINDOW_ARRANGE_OUTER` | adaptive (~12) | Padding on top/bottom/left/right (outside reserved bars) |
+| `WINDOW_ARRANGE_GAP` | adaptive (~12) | Gap between grid cells |
+| `WINDOW_ARRANGE_OUTER` | adaptive (~16) | Padding on top/bottom/left/right (outside reserved bars) |
 | `WINDOW_ARRANGE_PHONE_W` | adaptive | scrcpy strip width (logical px) |
 | `WINDOW_ARRANGE_PHONE_H` | adaptive | scrcpy strip height (logical px) |
-| `WINDOW_ARRANGE_ADAPT` | `1` | Set `0` to lock classic 8/12/360/800 defaults (still logical geometry) |
-
+| `WINDOW_ARRANGE_ADAPT` | `1` | Set `0` to lock 12/16/360/800 defaults (still logical geometry) |
 Example:
 
 ```bash
