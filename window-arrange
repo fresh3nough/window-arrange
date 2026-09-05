@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# window-arrange — tidy every mapped window on the active workspace.
+#
+# Omarchy-style layout (not fullscreen / not edge-to-edge chrome):
+#   • Exit fullscreen / maximized on every window (bar + wallpaper stay visible)
+#   • Non-phone apps → tiled (dwindle) with normal Omarchy gaps
+#   • scrcpy / Pixel → compact floating portrait strip on the right
+#   • Even outer padding (default 12px) outside the reserved top bar
+#
+# Usage:
+#   window-arrange           # apply
+#   window-arrange --dry-run # print plan only
+#
+# Env knobs:
+#   WINDOW_ARRANGE_GAP=8
+#   WINDOW_ARRANGE_OUTER=12   # padding on all sides (top/bottom/left/right)
+#   WINDOW_ARRANGE_PHONE_W=360
+#   WINDOW_ARRANGE_PHONE_H=800
+set -euo pipefail
+
+GAP="${WINDOW_ARRANGE_GAP:-8}"
+OUTER="${WINDOW_ARRANGE_OUTER:-12}"
+PHONE_W="${WINDOW_ARRANGE_PHONE_W:-360}"
+PHONE_H="${WINDOW_ARRANGE_PHONE_H:-800}"
+DRY=0
+[[ "${1:-}" == "--dry-run" || "${1:-}" == "-n" ]] && DRY=1
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
+need hyprctl
+need python3
+
+dispatch() {
+  local lua="$1"
+  shift
+  if [ "$DRY" -eq 1 ]; then
+    return 0
+  fi
+  hyprctl dispatch "$lua" >/dev/null 2>&1 || {
+    [ "$#" -gt 0 ] && hyprctl dispatch "$@" >/dev/null 2>&1 || true
+  }
+}
+
+# Snapshot workspace → JSON plan
+PLAN="$(
+  GAP="$GAP" OUTER="$OUTER" PHONE_W="$PHONE_W" PHONE_H="$PHONE_H" python3 <<'PY'
+import json, math, os, subprocess, sys
+
+gap = int(os.environ.get("GAP", "8"))
+outer = int(os.environ.get("OUTER", "12"))
+phone_w = int(os.environ.get("PHONE_W", "360"))
+phone_h = int(os.environ.get("PHONE_H", "800"))
+
+def load(cmd):
+    return json.loads(subprocess.check_output(cmd, text=True))
+
+monitors = load(["hyprctl", "monitors", "-j"])
+clients = load(["hyprctl", "clients", "-j"])
+active = load(["hyprctl", "activeworkspace", "-j"])
+ws_id = active.get("id")
+mon = next((m for m in monitors if m.get("focused")), monitors[0])
+mw, mh = int(mon["width"]), int(mon["height"])
+mx, my = int(mon.get("x", 0)), int(mon.get("y", 0))
+# Hyprland reserved = [left, top, right, bottom]
+res = mon.get("reserved") or [0, 0, 0, 0]
+rl, rt, rr, rb = (int(res[0]), int(res[1]), int(res[2]), int(res[3]))
+
+# Work area: reserved bars + OUTER padding on every side (wallpaper shows in pad).
+x0 = mx + rl + outer
+y0 = my + rt + outer
+x1 = mx + mw - rr - outer
+y1 = my + mh - rb - outer
+area_w = max(200, x1 - x0)
+area_h = max(200, y1 - y0)
+
+def is_phone(c):
+    cls = (c.get("class") or "").lower()
+    title = (c.get("title") or "").lower()
+    return cls == "scrcpy" or title == "pixel" or "scrcpy" in cls
+
+wins = []
+for c in clients:
+    if not c.get("mapped") or c.get("hidden"):
+        continue
+    ws = c.get("workspace") or {}
+    if ws.get("id") != ws_id:
+        continue
+    if str(ws.get("name", "")).startswith("special"):
+        continue
+    addr = c.get("address")
+    if not addr:
+        continue
+    wins.append(c)
+
+if not wins:
+    print("NO_WINDOWS", file=sys.stderr)
+    sys.exit(0)
+
+phones = [c for c in wins if is_phone(c)]
+others = [c for c in wins if not is_phone(c)]
+# Prefer main apps first (currently tiled / non-float), stable by class
+others.sort(key=lambda c: (
+    0 if not c.get("floating") else 1,
+    (c.get("class") or "").lower(),
+    (c.get("title") or "").lower(),
+))
+
+plan = []
+
+# ---- Phone strip (float, portrait, right) ----
+phone = phones[0] if phones else None
+extra_phones = phones[1:]
+others = others + extra_phones
+
+right_w = 0
+if phone:
+    pw = min(phone_w, max(280, area_w // 5))
+    ph = min(phone_h, area_h)
+    if ph / max(pw, 1) < 1.7:
+        ph = min(area_h, int(pw * 2.1))
+    px = x1 - pw
+    py = y0 + max(0, (area_h - ph) // 2)
+    plan.append({
+        "address": phone["address"],
+        "class": phone.get("class") or "",
+        "role": "phone",
+        "mode": "float",
+        "x": int(px), "y": int(py), "w": int(pw), "h": int(ph),
+        "fullscreen": phone.get("fullscreen") not in (0, False, None),
+        "floating": bool(phone.get("floating")),
+        "pinned": bool(phone.get("pinned")),
+    })
+    right_w = pw + gap
+
+# ---- Other windows: float into an Omarchy-like grid (gaps, never fullscreen)
+# We float+place instead of pure dwindle so sizes stay even; still leave
+# OUTER padding so the desktop background and top bar remain visible.
+grid_x0, grid_y0 = x0, y0
+grid_w = max(200, (x1 - right_w) - grid_x0)
+grid_h = max(200, y1 - grid_y0)
+n = len(others)
+
+if n > 0:
+    best = None
+    for cols in range(1, n + 1):
+        rows = math.ceil(n / cols)
+        cw = (grid_w - gap * (cols - 1)) / cols
+        rh = (grid_h - gap * (rows - 1)) / rows
+        if cw < 180 or rh < 140:
+            continue
+        aspect = cw / max(rh, 1)
+        empty = cols * rows - n
+        score = abs(math.log(max(aspect, 0.05) / 1.55))
+        score += 0.25 * empty
+        score += 0.12 * abs(cols - math.ceil(math.sqrt(n)))
+        if grid_w > grid_h * 1.4:
+            score += 0.08 * rows
+        if best is None or score < best[0]:
+            best = (score, cols, rows, cw, rh)
+    if best is None:
+        cols, rows = n, 1
+        cw = (grid_w - gap * (cols - 1)) / max(cols, 1)
+        rh = grid_h
+    else:
+        _, cols, rows, cw, rh = best
+    cw_i, rh_i = int(cw), int(rh)
+
+    for i, c in enumerate(others):
+        r, col = i // cols, i % cols
+        row_start = r * cols
+        row_count = min(cols, n - row_start)
+        if row_count < cols and row_count > 0:
+            cell_w = int((grid_w - gap * (row_count - 1)) / row_count)
+            cx = grid_x0 + col * (cell_w + gap)
+        else:
+            cell_w = cw_i
+            cx = grid_x0 + col * (cw_i + gap)
+        cy = grid_y0 + r * (rh_i + gap)
+        cell_h = rh_i
+        # Clamp inside padded work area (never under the bar / off-screen).
+        cx = max(grid_x0, min(cx, x1 - right_w - 120))
+        cy = max(grid_y0, min(cy, y1 - 120))
+        if cx + cell_w > x1 - right_w:
+            cell_w = max(120, (x1 - right_w) - cx)
+        if cy + cell_h > y1:
+            cell_h = max(120, y1 - cy)
+        plan.append({
+            "address": c["address"],
+            "class": c.get("class") or "",
+            "role": "grid",
+            "mode": "float",  # placed float = even cells; still padded like tiles
+            "x": int(cx), "y": int(cy), "w": int(cell_w), "h": int(cell_h),
+            "fullscreen": c.get("fullscreen") not in (0, False, None),
+            "floating": bool(c.get("floating")),
+            "pinned": bool(c.get("pinned")),
+        })
+
+for item in plan:
+    print(json.dumps(item))
+PY
+)" || true
+
+if [ -z "${PLAN}" ]; then
+  echo "window-arrange: nothing to layout on this workspace" >&2
+  exit 0
+fi
+
+apply_one() {
+  local addr="$1" cls="$2" role="$3" mode="$4"
+  local x="$5" y="$6" w="$7" h="$8"
+  local was_fs="$9" was_floating="${10}" was_pinned="${11}"
+  local window="address:${addr}"
+
+  if [ "$DRY" -eq 1 ]; then
+    printf 'PLAN %s %-12s %s → %dx%d @ %d,%d%s%s\n' \
+      "$role" "$cls" "$mode" "$w" "$h" "$x" "$y" \
+      "$([ "$was_fs" = "True" ] || [ "$was_fs" = "true" ] && echo ' [exit-fullscreen]' || true)" \
+      "$([ "$was_pinned" = "True" ] || [ "$was_pinned" = "true" ] && echo ' [unpin]' || true)"
+    return 0
+  fi
+
+  # 1) Always leave fullscreen / maximized so the Omarchy bar + wallpaper show.
+  # fullscreenmode 0 = exit; try a few dispatcher forms used across Hypr builds.
+  if [ "$was_fs" = "True" ] || [ "$was_fs" = "true" ] || [ "$was_fs" = "1" ] || [ "$was_fs" = "2" ]; then
+    dispatch "hl.dsp.focus({ window = \"$window\" })" focuswindow "$window"
+    dispatch "hl.dsp.window.fullscreen({ mode = \"0\" })" fullscreen 0
+    # Some builds use fullscreenstate
+    hyprctl dispatch fullscreenstate 0 0 >/dev/null 2>&1 || true
+    sleep 0.05
+  fi
+
+  # 2) Unpin pop-outs so they can move/resize.
+  if [ "$was_pinned" = "True" ] || [ "$was_pinned" = "true" ]; then
+    dispatch "hl.dsp.window.pin({ window = \"$window\" })" pin "$window"
+  fi
+
+  # 3) Ensure floating for placed layout (even Omarchy-like cells with padding).
+  if [ "$was_floating" != "True" ] && [ "$was_floating" != "true" ]; then
+    dispatch "hl.dsp.window.float({ window = \"$window\", action = \"toggle\" })" \
+      togglefloating "$window"
+  fi
+
+  dispatch "hl.dsp.focus({ window = \"$window\" })" focuswindow "$window"
+  dispatch "hl.dsp.window.resize({ window = \"$window\", x = $w, y = $h })" \
+    resizeactive exact "$w" "$h"
+  dispatch "hl.dsp.window.move({ window = \"$window\", x = $x, y = $y })" \
+    moveactive exact "$x" "$y"
+
+  # Drop +pop tag if present so windows behave normally
+  hyprctl dispatch "hl.dsp.window.tag({ window = \"$window\", tag = \"-pop\" })" >/dev/null 2>&1 || true
+
+  sleep 0.04
+  # Verify + one retry
+  local got gx gy gw gh
+  got="$(hyprctl clients -j | python3 -c "
+import json,sys
+a='$addr'
+for c in json.load(sys.stdin):
+  if c.get('address')==a:
+    print(c['at'][0], c['at'][1], c['size'][0], c['size'][1], int(bool(c.get('fullscreen'))))
+    break
+" 2>/dev/null || true)"
+  read -r gx gy gw gh gfs <<<"${got:-0 0 0 0 0}"
+  if [ "${gfs:-0}" != "0" ]; then
+    dispatch "hl.dsp.focus({ window = \"$window\" })"
+    dispatch "hl.dsp.window.fullscreen({ mode = \"0\" })" fullscreen 0
+    hyprctl dispatch fullscreenstate 0 0 >/dev/null 2>&1 || true
+  fi
+  if [ -n "${gx:-}" ] && [ "$gx" != "0" ] || [ "${gy:-0}" != "0" ]; then
+    if [ $((gx < x - 20 || gx > x + 20 || gy < y - 20 || gy > y + 20 || gw < w - 20 || gw > w + 20 || gh < h - 20 || gh > h + 20)) -eq 1 ]; then
+      dispatch "hl.dsp.window.resize({ window = \"$window\", x = $w, y = $h })"
+      dispatch "hl.dsp.window.move({ window = \"$window\", x = $x, y = $y })"
+    fi
+  fi
+
+  printf 'OK %s %-12s → %dx%d @ %d,%d\n' "$role" "$cls" "$w" "$h" "$x" "$y"
+}
+
+count=0
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  eval "$(printf '%s' "$line" | python3 -c '
+import json,sys,shlex
+o=json.load(sys.stdin)
+def q(s): return shlex.quote(str(s))
+print("addr=%s cls=%s role=%s mode=%s x=%s y=%s w=%s h=%s was_fs=%s was_floating=%s was_pinned=%s" % (
+  q(o["address"]), q(o["class"]), q(o["role"]), q(o["mode"]),
+  q(o["x"]), q(o["y"]), q(o["w"]), q(o["h"]),
+  q(o.get("fullscreen", False)), q(o.get("floating", False)), q(o.get("pinned", False)),
+))
+')"
+  apply_one "$addr" "$cls" "$role" "$mode" "$x" "$y" "$w" "$h" "$was_fs" "$was_floating" "$was_pinned"
+  count=$((count + 1))
+done <<< "$PLAN"
+
+if [ "$DRY" -eq 0 ] && [ "$count" -gt 0 ]; then
+  if command -v omarchy-notification-send >/dev/null 2>&1; then
+    omarchy-notification-send -g "󰕰" "Arranged $count windows" "Padded grid · bar & wallpaper visible" 2>/dev/null || true
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send -a window-arrange "Arranged $count windows" 2>/dev/null || true
+  fi
+fi
+
+exit 0
