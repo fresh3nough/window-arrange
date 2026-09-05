@@ -19,7 +19,7 @@ cd window-arrange
 bash install.sh
 ```
 
-`install.sh` puts the binary and `layout.py` on `~/.local/bin` (and a copy under `~/.local/share/window-arrange`), rebinds **Super+J** (replaces dwindle togglesplit), and binds **Super+Alt+A**.
+`install.sh` puts the binary and `layout.py` on `~/.local/bin` (and a copy under `~/.local/share/window-arrange`), rebinds **Super+J** (replaces dwindle togglesplit), binds **Super+Alt+A**, and hooks **`window-arrange --on-start`** into `~/.config/hypr/autostart.lua` so the grid runs after autoload apps map.
 
 Why Super+J: default Omarchy `togglesplit` only flips already-tiled dwindle leaves. Floated / popped / maximized windows ignore it and keep stacking — the usual ultrawide / Surface Book mess. Arrange always re-packs the free work area as a responsive grid instead.
 
@@ -33,32 +33,36 @@ install -m 0644 layout.py ~/.local/share/window-arrange/layout.py
 #   hl.unbind("SUPER + J")
 #   o.bind("SUPER + J", "Arrange windows (grid)", "window-arrange")
 #   o.bind("SUPER + ALT + A", "Arrange windows", "window-arrange")
+# optional boot hook in ~/.config/hypr/autostart.lua:
+#   o.exec_on_start("window-arrange --on-start")
 ```
 
 ## Performance
 
-Previous versions focused/resized/moved each window with sleeps and 3× verify
-retries, then ran a second pass — with 5+ windows that thrashed the compositor
-for up to a minute (windows visibly hopping). Current path:
+Hyprland **0.56+** (Omarchy) is Lua-first: legacy `hyprctl dispatch resizewindowpixel …`
+is rejected, so older "batch of pixel dispatches" paths reported OK and moved
+nothing. Current path:
 
-1. One `layout.py` plan  
-2. One `hyprctl clients -j` snapshot  
-3. One `hyprctl --batch` of address-targeted `resizewindowpixel` / `movewindowpixel`  
-4. Animations briefly disabled for the batch so cells appear in place  
+1. One `layout.py` plan (logical px)  
+2. One `hyprctl clients -j` snapshot (fullscreen / pinned / tags)  
+3. One `hyprctl eval` of `hl.dsp.window.*` (strip Omarchy float tags, exit fs
+   with `mode=false`, `float({on=true})`, resize+move twice)  
 
-Typical wall time on 5 windows: **~0.1s**. No focus cycling.
+Typical wall time on 5–6 windows: **~5–20ms** eval. No focus cycling, no sleeps.
 
 ## Usage
 
 ```bash
 window-arrange              # apply layout
 window-arrange --dry-run    # print plan only
+window-arrange --on-start   # wait for autostart apps, then arrange once
 ```
 
 | Action | Shortcut | On a Mac host |
 |--------|----------|----------------|
 | Arrange windows (grid) | **Super+J** | **Super+Option+J** |
 | Arrange windows (alias) | **Super+Alt+A** | **Super+Option+A** |
+| Arrange after boot apps | autostart | `window-arrange --on-start` |
 
 ## Environment
 
@@ -69,11 +73,17 @@ window-arrange --dry-run    # print plan only
 | `WINDOW_ARRANGE_PHONE_W` | adaptive | scrcpy strip width (logical px) |
 | `WINDOW_ARRANGE_PHONE_H` | adaptive | scrcpy strip height (logical px) |
 | `WINDOW_ARRANGE_ADAPT` | `1` | Set `0` to lock 12/16/360/800 defaults (still logical geometry) |
+| `WINDOW_ARRANGE_NOTIFY` | `1` (`0` under `--on-start`) | Set `0` to silence toast |
+| `WINDOW_ARRANGE_ON_START_WAIT` | `8` | Seconds `--on-start` polls for mapped windows |
+| `WINDOW_ARRANGE_ON_START_MIN` | `2` | Min mapped windows before arranging |
+| `WINDOW_ARRANGE_ON_START_STABLE` | `2` | Consecutive identical snapshots required |
+
 Example:
 
 ```bash
 WINDOW_ARRANGE_OUTER=16 WINDOW_ARRANGE_GAP=10 window-arrange
 WINDOW_ARRANGE_ADAPT=0 window-arrange --dry-run
+WINDOW_ARRANGE_ON_START_WAIT=12 window-arrange --on-start
 ```
 
 ## Tests

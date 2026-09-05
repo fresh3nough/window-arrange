@@ -156,6 +156,10 @@ def choose_grid(n: int, grid_w: int, grid_h: int, gap: int) -> tuple[int, int]:
     Caps column count so average cell width stays at or above toolkit min
     widths (~500 logical px). Prefers two rows when height allows so electron
     shells keep ~400px height.
+
+    For six windows on ~1400-wide logical canvases, a 3x2 grid (~461x440)
+    beats a 2x3 / dual stack of three (~700x292): height under ~400 is worse
+    for Goose/Electron than a modestly-narrower browser column.
     """
     if n <= 0:
         return 0, 0
@@ -164,14 +168,15 @@ def choose_grid(n: int, grid_w: int, grid_h: int, gap: int) -> tuple[int, int]:
     prefer_rh = 400
     hard_cw = max(160, min(240, grid_w // 5 if grid_w else 160))
     hard_rh = max(120, min(160, grid_h // 4 if grid_h else 120))
-    # Never try more columns than can hold prefer_cw (prevents Goose/Chrome spill).
+    # Prefer columns that hold prefer_cw; allow one extra col when a 2-row
+    # layout needs it to keep row height above toolkit clamps.
     max_cols = max(1, (grid_w + gap) // (prefer_cw + gap))
+    # Soft width for the extra column (still above hard_cw).
+    soft_cw = max(hard_cw, min(prefer_cw, 460))
+    soft_max_cols = max(max_cols, (grid_w + gap) // (soft_cw + gap))
 
     best: tuple[float, int, int] | None = None
     for cols in range(1, n + 1):
-        if cols > max_cols and max_cols >= 1:
-            # Still allow denser grids if nothing else fits hard mins.
-            pass
         rows = math.ceil(n / cols)
         cw = (grid_w - gap * (cols - 1)) / cols
         rh = (grid_h - gap * (rows - 1)) / rows
@@ -185,17 +190,23 @@ def choose_grid(n: int, grid_w: int, grid_h: int, gap: int) -> tuple[int, int]:
         if cw < prefer_cw:
             score += 2.0 * ((prefer_cw - cw) / prefer_cw)
         if rh < prefer_rh:
-            score += 1.0 * ((prefer_rh - rh) / prefer_rh)
+            # Height clamps (Goose ~400) hurt more than a mild width shortfall.
+            score += 2.4 * ((prefer_rh - rh) / prefer_rh)
         if rows >= 3 and rh < prefer_rh:
-            score += 1.2
-        # Heavy penalty when a column count exceeds the safe max (spill risk).
-        if cols > max_cols:
-            score += 3.0 * (cols - max_cols)
+            score += 1.8
+        # Prefer filling even counts into two equal rows when width allows.
+        if n >= 6 and rows == 2 and empty == 0 and cw >= soft_cw:
+            score -= 0.8
+        # Heavy penalty past soft max; light penalty between prefer and soft.
+        if cols > soft_max_cols:
+            score += 3.0 * (cols - soft_max_cols)
+        elif cols > max_cols:
+            score += 0.9 * (cols - max_cols)
         if best is None or score < best[0]:
             best = (score, cols, rows)
 
     if best is None:
-        cols = max(1, min(n, max_cols))
+        cols = max(1, min(n, soft_max_cols))
         rows = int(math.ceil(n / cols))
         return cols, rows
     return best[1], best[2]
@@ -292,10 +303,19 @@ def place_grid(
         densest_cols = 3  # 2+3 layout
     densest_cw = (grid_w - gap * (densest_cols - 1)) / max(densest_cols, 1)
     densest_rh = (grid_h - gap * (rows - 1)) / max(rows, 1)
+    soft_cw = max(160, min(prefer_cw, 460))
+    # Five-up on ~1400-wide: 2+3 cells are ~461px < Chromium/Goose clamp (~500).
+    # Always use two-column stacks there. Six-up 3x2 (~460x440) keeps height and
+    # is preferred over dual 3-stacks (~700x292) that crush Goose min-height.
+    if n == 5 and densest_cw < prefer_cw and grid_w >= prefer_cw * 2 + gap:
+        return place_column_stacks(n, grid_x0, grid_y0, grid_w, grid_h, gap)
     needs_stacks = (
-        n >= 5
-        and (densest_cw < prefer_cw or densest_rh < prefer_rh)
+        n >= 6
         and grid_w >= prefer_cw * 2 + gap
+        and densest_cw < soft_cw
+        and densest_rh < prefer_rh
+        # Even-count 2-row grids that clear soft width keep uniform cells.
+        and not (n % 2 == 0 and rows == 2 and densest_cw >= soft_cw)
     )
     if needs_stacks:
         return place_column_stacks(n, grid_x0, grid_y0, grid_w, grid_h, gap)

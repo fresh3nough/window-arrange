@@ -144,6 +144,21 @@ class TestPlaceGrid(unittest.TestCase):
         self.assertGreaterEqual(rows, 1)
         self.assertGreaterEqual(cols, 1)
 
+    def test_six_windows_prefer_three_by_two(self):
+        # On HiDPI logical ~1408x902, 3x2 keeps ~440px rows (Goose-safe).
+        # 2x3 / dual 3-stacks crush height to ~292.
+        cols, rows = choose_grid(6, 1408, 902, 12)
+        self.assertEqual((cols, rows), (3, 2))
+        cells = place_grid(6, 16, 42, 1408, 902, 12)
+        self.assertEqual(len(cells), 6)
+        heights = [h for _x, _y, _w, h in cells]
+        widths = [w for _x, _y, w, _h in cells]
+        self.assertTrue(all(h >= 400 for h in heights), heights)
+        self.assertTrue(all(w >= 440 for w in widths), widths)
+        for i, a in enumerate(cells):
+            for b in cells[i + 1 :]:
+                self.assertFalse(rects_overlap(a, b), f"{a} vs {b}")
+
 
 class TestPlanBounds(unittest.TestCase):
     def _assert_in_logical(self, plan, mon, outer=16):
@@ -180,6 +195,28 @@ class TestPlanBounds(unittest.TestCase):
             self.assertLess(item["y"], 960, msg=f"off-screen y: {item}")
             # Column-stack / safe grid: half-width cells stay above toolkit clamps.
             self.assertGreaterEqual(item["w"], 480, msg=item)
+
+    def test_hidpi_six_windows_two_row_heights(self):
+        mon = mon_hidpi()
+        clients = [
+            fake_client("0x1", "chromium"),
+            fake_client("0x2", "code"),
+            fake_client("0x3", "foot"),
+            fake_client("0x4", "1password"),
+            fake_client("0x5", "goose"),
+            fake_client("0x6", "TUI.float"),
+        ]
+        plan = build_plan(
+            [mon], clients, {"id": 1},
+            gap=12, outer=16, auto_adapt=False,
+        )
+        self.assertEqual(len(plan), 6)
+        self._assert_in_logical(plan, mon, outer=16)
+        assert_no_plan_overlap(self, plan)
+        # Prefer 3x2 so Goose/Electron clear ~400px height.
+        for item in plan:
+            self.assertGreaterEqual(item["h"], 400, msg=item)
+            self.assertGreaterEqual(item["w"], 440, msg=item)
 
     def test_scale1_maclike_fits(self):
         mon = mon_scale1_maclike()
