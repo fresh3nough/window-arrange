@@ -76,7 +76,7 @@ window-arrange --on-start   # wait for autostart apps, then arrange once
 
 `window-arrange --edit` opens a **transparent** full-monitor overlay (GTK4 layer-shell) so the real desktop stays visible:
 
-- **Drag a window's body** onto another window → **swap** their cells (applied immediately)
+- **Drag a window's body** onto another window → **swap** cells in the same row, or **flip whole rows** when dropping across bands (e.g. 2-up top ↔ full-width bottom)
 - **Drag an edge or corner** → grow/shrink that side; **abutting neighbors move with it** and real windows **resize live under the outline** (no white wash, no wait-for-Apply)
 - Free-edge growth stops at non-neighbor obstacles and the work-area bound — cells never overlap
 - **Enter** / **Done** keeps the live layout and closes

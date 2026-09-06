@@ -474,6 +474,212 @@ def swap_windows(
     return out
 
 
+# How close two windows' vertical centers / y-ranges must be to share a row band.
+BAND_Y_SLOP = 48
+
+
+def _split_axis(total: int, count: int, gap: int) -> list[tuple[int, int]]:
+    """Partition `total` px into `count` segments separated by `gap`.
+
+    Returns [(offset_from_start, size), ...] — same contract as layout.split_axis.
+    """
+    if count <= 0:
+        return []
+    if count == 1:
+        return [(0, max(1, total))]
+    gap = max(0, int(gap))
+    usable = total - gap * (count - 1)
+    if usable < count:
+        usable = count
+    base, rem = divmod(usable, count)
+    out: list[tuple[int, int]] = []
+    pos = 0
+    for i in range(count):
+        size = base + (1 if i < rem else 0)
+        out.append((pos, size))
+        pos += size + gap
+    return out
+
+
+def detect_row_bands(
+    windows: list[dict[str, Any]],
+    *,
+    y_slop: int = BAND_Y_SLOP,
+) -> list[list[int]]:
+    """Group window indices into horizontal row-bands, top → bottom.
+
+    Windows whose vertical spans substantially overlap (or whose y-centers are
+    within `y_slop`) share a band. Within a band, indices are left → right.
+    This is what lets a full-width bottom tile trade places with a 2-up top row.
+    """
+    n = len(windows)
+    if n == 0:
+        return []
+    # Greedy cluster by sorted y-center.
+    order = sorted(range(n), key=lambda i: (windows[i]["y"] + windows[i]["h"] / 2, windows[i]["x"]))
+    bands: list[list[int]] = []
+    band_y0: list[float] = []
+    band_y1: list[float] = []
+    for i in order:
+        y = float(windows[i]["y"])
+        y1 = y + float(windows[i]["h"])
+        cy = (y + y1) / 2.0
+        placed = False
+        for b, members in enumerate(bands):
+            # Join if center is near the band's vertical range, or ranges overlap a lot.
+            if band_y0[b] - y_slop <= cy <= band_y1[b] + y_slop:
+                members.append(i)
+                band_y0[b] = min(band_y0[b], y)
+                band_y1[b] = max(band_y1[b], y1)
+                placed = True
+                break
+            # Substantial vertical overlap with the band's union.
+            ov = interval_overlap(int(y), int(y1), int(band_y0[b]), int(band_y1[b]))
+            if ov > 0.4 * min(y1 - y, band_y1[b] - band_y0[b]):
+                members.append(i)
+                band_y0[b] = min(band_y0[b], y)
+                band_y1[b] = max(band_y1[b], y1)
+                placed = True
+                break
+        if not placed:
+            bands.append([i])
+            band_y0.append(y)
+            band_y1.append(y1)
+    # Sort bands top→bottom by their top edge; members left→right.
+    ranked = sorted(range(len(bands)), key=lambda b: band_y0[b])
+    result: list[list[int]] = []
+    for b in ranked:
+        members = sorted(bands[b], key=lambda i: windows[i]["x"])
+        result.append(members)
+    return result
+
+
+def _band_frame(
+    windows: list[dict[str, Any]],
+    members: list[int],
+) -> tuple[int, int, int, int]:
+    """Bounding box of a band: (x0, y0, x1, y1)."""
+    xs = [windows[i]["x"] for i in members]
+    ys = [windows[i]["y"] for i in members]
+    x1s = [windows[i]["x"] + windows[i]["w"] for i in members]
+    y1s = [windows[i]["y"] + windows[i]["h"] for i in members]
+    return min(xs), min(ys), max(x1s), max(y1s)
+
+
+def _place_in_frame(
+    out: list[dict[str, Any]],
+    members: list[int],
+    frame: tuple[int, int, int, int],
+    gap: int,
+    *,
+    min_w: int,
+    min_h: int,
+) -> None:
+    """Lay `members` (left→right order) evenly into `frame` as a single row."""
+    x0, y0, x1, y1 = frame
+    fw = max(1, x1 - x0)
+    fh = max(1, y1 - y0)
+    n = len(members)
+    if n == 0:
+        return
+    segs = _split_axis(fw, n, gap)
+    for (off, size), idx in zip(segs, members):
+        out[idx]["x"] = int(x0 + off)
+        out[idx]["y"] = int(y0)
+        out[idx]["w"] = max(min_w, int(size))
+        out[idx]["h"] = max(min_h, int(fh))
+        # If min_w forced a wider tile, clip to frame rather than overflow.
+        if out[idx]["x"] + out[idx]["w"] > x1:
+            out[idx]["w"] = max(min_w, x1 - out[idx]["x"])
+        if out[idx]["y"] + out[idx]["h"] > y1:
+            out[idx]["h"] = max(min_h, y1 - out[idx]["y"])
+
+
+def swap_bands(
+    windows: list[dict[str, Any]],
+    band_a: list[int],
+    band_b: list[int],
+    *,
+    gap: int = DEFAULT_GAP,
+    min_w: int = DEFAULT_MIN_W,
+    min_h: int = DEFAULT_MIN_H,
+    bounds: tuple[int, int, int, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Exchange the row-frames of two bands, redistributing members into each.
+
+    Classic case: top band has 2 half-width tiles, bottom band has 1 full-width
+    tile. After the swap the single window fills the old top frame and the pair
+    splits the old bottom frame — identities stay with their windows.
+    """
+    if not band_a or not band_b:
+        return clone_windows(windows)
+    if set(band_a) & set(band_b):
+        return clone_windows(windows)
+
+    out = clone_windows(windows)
+    frame_a = _band_frame(windows, band_a)
+    frame_b = _band_frame(windows, band_b)
+
+    # Preserve left→right order within each band as they move.
+    order_a = sorted(band_a, key=lambda i: windows[i]["x"])
+    order_b = sorted(band_b, key=lambda i: windows[i]["x"])
+
+    _place_in_frame(out, order_a, frame_b, gap, min_w=min_w, min_h=min_h)
+    _place_in_frame(out, order_b, frame_a, gap, min_w=min_w, min_h=min_h)
+
+    if not layout_is_valid(out, bounds, min_w=min_w, min_h=min_h):
+        return clone_windows(windows)
+    return out
+
+
+def rearrange_drop(
+    windows: list[dict[str, Any]],
+    src: int,
+    dst: int,
+    *,
+    gap: int = DEFAULT_GAP,
+    min_w: int = DEFAULT_MIN_W,
+    min_h: int = DEFAULT_MIN_H,
+    bounds: tuple[int, int, int, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Body-drop rearrange: same-band → cell swap; cross-band → full band swap.
+
+    Dropping any window from a multi-tile top row onto the full-width bottom
+    window (or the reverse) flips the two row frames so the pair moves down and
+    the single window moves up — the interaction the 1:1 geometry swap could
+    not express.
+    """
+    out = clone_windows(windows)
+    n = len(out)
+    if src == dst or src < 0 or dst < 0 or src >= n or dst >= n:
+        return out
+
+    bands = detect_row_bands(out)
+    band_of = [-1] * n
+    for bi, members in enumerate(bands):
+        for i in members:
+            band_of[i] = bi
+
+    bs, bd = band_of[src], band_of[dst]
+    if bs < 0 or bd < 0:
+        return swap_windows(out, src, dst)
+
+    if bs == bd:
+        # Same row: simple cell swap keeps the band's column structure.
+        return swap_windows(out, src, dst)
+
+    # Different rows: swap the entire bands' frames (handles 2-up ↔ 1-up).
+    return swap_bands(
+        out,
+        bands[bs],
+        bands[bd],
+        gap=gap,
+        min_w=min_w,
+        min_h=min_h,
+        bounds=bounds,
+    )
+
+
 def hit_test_handle(
     windows: list[dict[str, Any]],
     px: int,

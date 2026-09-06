@@ -60,10 +60,11 @@ from geometry import (  # noqa: E402
     HANDLE_PX,
     clone_windows,
     cursor_for_handle,
+    detect_row_bands,
     hit_test_handle,
     layout_is_valid,
+    rearrange_drop,
     resize_handle,
-    swap_windows,
     window_at,
 )
 from layout import logical_monitor_box, work_area  # noqa: E402
@@ -178,6 +179,7 @@ class ArrangeCanvas(Gtk.DrawingArea):
         self._hover_handle: str | None = None
         self._hover_index: int | None = None
         self._swap_target: int | None = None
+        self._swap_band: list[int] = []  # all indices highlighted on cross-band drop
         self._ghost_xy: tuple[float, float] | None = None
         self._last_applied_sig: tuple | None = _geom_signature(self.windows)
         self._live_pending = False
@@ -293,6 +295,7 @@ class ArrangeCanvas(Gtk.DrawingArea):
             pass
         self._drag_index = None
         self._swap_target = None
+        self._swap_band = []
         self.queue_draw()
 
     def _on_motion(self, _ctrl, x: float, y: float) -> None:
@@ -339,6 +342,7 @@ class ArrangeCanvas(Gtk.DrawingArea):
         self._drag_origin_windows = clone_windows(self.windows)
         self._drag_start_local = (x, y)
         self._swap_target = None
+        self._swap_band = []
         self._ghost_xy = (x, y)
         name = cursor_for_handle(handle)
         if name == "grab":
@@ -361,9 +365,9 @@ class ArrangeCanvas(Gtk.DrawingArea):
         if handle == "body":
             gx, gy = self._to_global(cx, cy)
             self.windows = clone_windows(self._drag_origin_windows)
-            self._swap_target = window_at(
-                self.windows, gx, gy, exclude=self._drag_index
-            )
+            target = window_at(self.windows, gx, gy, exclude=self._drag_index)
+            self._swap_target = target
+            self._swap_band = self._band_mates(self._drag_index, target)
             # Body drag only previews swap; apply happens on release.
         else:
             self.windows = resize_handle(
@@ -378,6 +382,7 @@ class ArrangeCanvas(Gtk.DrawingArea):
                 bounds=self.bounds,
             )
             self._swap_target = None
+            self._swap_band = []
             self._schedule_live_apply()
         self.queue_draw()
 
@@ -395,8 +400,14 @@ class ArrangeCanvas(Gtk.DrawingArea):
                     self._drag_origin_windows, gx, gy, exclude=self._drag_index
                 )
                 if target is not None:
-                    self.windows = swap_windows(
-                        self._drag_origin_windows, self._drag_index, target
+                    self.windows = rearrange_drop(
+                        self._drag_origin_windows,
+                        self._drag_index,
+                        target,
+                        gap=self.gap,
+                        min_w=self.min_w,
+                        min_h=self.min_h,
+                        bounds=self.bounds,
                     )
                     self._apply_now(self.windows)
                 else:
@@ -409,12 +420,32 @@ class ArrangeCanvas(Gtk.DrawingArea):
         self._reset_drag()
         self.queue_draw()
 
+    def _band_mates(self, src: int | None, dst: int | None) -> list[int]:
+        """Indices to highlight on drop preview (whole destination band if cross-row)."""
+        if src is None or dst is None:
+            return []
+        bands = detect_row_bands(self.windows)
+        band_of = {}
+        for bi, members in enumerate(bands):
+            for i in members:
+                band_of[i] = bi
+        bs, bd = band_of.get(src, -1), band_of.get(dst, -1)
+        if bs < 0 or bd < 0:
+            return [dst]
+        if bs == bd:
+            return [dst]
+        # Cross-band: highlight every window in the destination band (and
+        # lightly the rest of the source band so the flip reads clearly).
+        mates = list(bands[bd]) + [i for i in bands[bs] if i != src]
+        return mates
+
     def _reset_drag(self) -> None:
         self._drag_index = None
         self._drag_handle = None
         self._drag_origin_windows = None
         self._drag_start_local = None
         self._swap_target = None
+        self._swap_band = []
         self._ghost_xy = None
         self.set_cursor(Gdk.Cursor.new_from_name("default"))
 
@@ -474,7 +505,7 @@ class ArrangeCanvas(Gtk.DrawingArea):
     def _draw_tile(self, cr, index: int, w: dict[str, Any]) -> None:
         lx, ly, lw, lh = self._to_local_rect(w)
         is_drag = self._drag_index == index
-        is_swap = self._swap_target == index
+        is_swap = index in self._swap_band or self._swap_target == index
         is_hover = self._hover_index == index and self._drag_index is None
 
         if is_swap:
@@ -559,7 +590,7 @@ class ArrangeCanvas(Gtk.DrawingArea):
 
     def _draw_hint_bar(self, cr, width: int, height: int) -> None:
         text = (
-            "Drag body to swap  ·  Edges/corners resize live  ·  "
+            "Drag body to swap rows/cells  ·  Edges resize live  ·  "
             "Enter done  ·  Esc restore  ·  R refresh"
         )
         pad_x, pad_y = 18, 10

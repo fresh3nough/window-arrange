@@ -12,11 +12,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from geometry import (  # noqa: E402
     any_overlaps,
+    detect_row_bands,
     find_neighbors,
     hit_test_handle,
     layout_is_valid,
+    rearrange_drop,
     resize_edge,
     resize_handle,
+    swap_bands,
     swap_windows,
     window_at,
 )
@@ -323,6 +326,113 @@ class TestSwap(unittest.TestCase):
         wins = [tile(0, 1, 2, 3, 4)]
         out = swap_windows(wins, 0, 0)
         self.assertEqual(out[0]["x"], 1)
+
+
+class TestRowBands(unittest.TestCase):
+    """2-on-top + 1-full-width-bottom must flip as whole row frames."""
+
+    def setUp(self):
+        # Top row: A | B   (each half width)
+        # Bottom:  C       (full width spanning both)
+        # gap=12, work area 0..512 x 0..424
+        self.gap = 12
+        self.wins = [
+            tile(0, 0, 0, 250, 200),      # A top-left
+            tile(1, 262, 0, 250, 200),    # B top-right  (250+12=262)
+            tile(2, 0, 212, 512, 212),    # C bottom full-width
+        ]
+        self.bounds = (0, 0, 512, 424)
+
+    def test_detect_two_bands(self):
+        bands = detect_row_bands(self.wins)
+        self.assertEqual(len(bands), 2)
+        self.assertEqual(bands[0], [0, 1])  # top L→R
+        self.assertEqual(bands[1], [2])     # bottom
+
+    def test_drop_bottom_onto_top_flips_rows(self):
+        # Drag C onto A → C takes the top frame full-width; A+B split the bottom.
+        out = rearrange_drop(
+            self.wins, 2, 0, gap=self.gap, min_w=40, min_h=40, bounds=self.bounds
+        )
+        self.assertFalse(any_overlaps(out))
+        self.assertTrue(layout_is_valid(out, self.bounds, min_w=40, min_h=40))
+        # C should now sit in the old top frame (y=0, full width ~512, h=200)
+        c = out[2]
+        self.assertEqual(c["y"], 0)
+        self.assertEqual(c["h"], 200)
+        self.assertEqual(c["x"], 0)
+        self.assertEqual(c["w"], 512)
+        # A and B share the old bottom frame
+        a, b = out[0], out[1]
+        self.assertEqual(a["y"], 212)
+        self.assertEqual(b["y"], 212)
+        self.assertEqual(a["h"], 212)
+        self.assertEqual(b["h"], 212)
+        self.assertLess(a["x"], b["x"])
+        # They split the 512px width with a gap
+        self.assertEqual(a["x"] + a["w"] + self.gap, b["x"])
+        self.assertEqual(b["x"] + b["w"], 512)
+
+    def test_drop_top_onto_bottom_flips_rows(self):
+        # Drag A onto C — same band flip (pair goes down, C goes up).
+        out = rearrange_drop(
+            self.wins, 0, 2, gap=self.gap, min_w=40, min_h=40, bounds=self.bounds
+        )
+        self.assertFalse(any_overlaps(out))
+        c = out[2]
+        self.assertEqual(c["y"], 0)
+        self.assertEqual(c["w"], 512)
+        self.assertEqual(out[0]["y"], 212)
+        self.assertEqual(out[1]["y"], 212)
+
+    def test_drop_within_top_row_is_cell_swap(self):
+        # A onto B → only those two cells swap; C stays put.
+        out = rearrange_drop(
+            self.wins, 0, 1, gap=self.gap, min_w=40, min_h=40, bounds=self.bounds
+        )
+        self.assertEqual(
+            (out[0]["x"], out[0]["y"], out[0]["w"], out[0]["h"]), (262, 0, 250, 200)
+        )
+        self.assertEqual(
+            (out[1]["x"], out[1]["y"], out[1]["w"], out[1]["h"]), (0, 0, 250, 200)
+        )
+        self.assertEqual(
+            (out[2]["x"], out[2]["y"], out[2]["w"], out[2]["h"]), (0, 212, 512, 212)
+        )
+
+    def test_swap_bands_direct(self):
+        out = swap_bands(
+            self.wins, [0, 1], [2], gap=self.gap, min_w=40, min_h=40, bounds=self.bounds
+        )
+        self.assertEqual(out[2]["y"], 0)
+        self.assertEqual(out[2]["w"], 512)
+        self.assertEqual(out[0]["y"], 212)
+        self.assertEqual(out[1]["y"], 212)
+        self.assertFalse(any_overlaps(out))
+
+    def test_three_plus_two_band_flip(self):
+        # Top 3 equal, bottom 2 equal — dropping any top onto any bottom flips.
+        gap = 10
+        wins = [
+            tile(0, 0, 0, 180, 150),
+            tile(1, 190, 0, 180, 150),
+            tile(2, 380, 0, 180, 150),
+            tile(3, 0, 160, 275, 200),
+            tile(4, 285, 160, 275, 200),
+        ]
+        bounds = (0, 0, 560, 360)
+        bands = detect_row_bands(wins)
+        self.assertEqual(bands, [[0, 1, 2], [3, 4]])
+        out = rearrange_drop(wins, 4, 1, gap=gap, min_w=40, min_h=40, bounds=bounds)
+        self.assertFalse(any_overlaps(out))
+        # Bottom pair should now occupy the top frame
+        self.assertEqual(out[3]["y"], 0)
+        self.assertEqual(out[4]["y"], 0)
+        self.assertEqual(out[3]["h"], 150)
+        # Top trio should occupy the bottom frame
+        for i in (0, 1, 2):
+            self.assertEqual(out[i]["y"], 160)
+            self.assertEqual(out[i]["h"], 200)
 
 
 class TestHitTest(unittest.TestCase):
