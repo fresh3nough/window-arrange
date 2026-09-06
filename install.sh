@@ -8,9 +8,11 @@ BIN_DIR="${HOME}/.local/bin"
 SHARE_DIR="${HOME}/.local/share/window-arrange"
 mkdir -p "$BIN_DIR" "$SHARE_DIR"
 
-# layout.py must sit next to the launcher (or under share/) for logical planning.
-install -m 0644 "${ROOT}/layout.py" "${SHARE_DIR}/layout.py"
-install -m 0644 "${ROOT}/layout.py" "${BIN_DIR}/layout.py"
+# Python modules must sit next to the launcher (or under share/) for planning + editor.
+for mod in layout.py geometry.py apply.py editor.py; do
+  install -m 0644 "${ROOT}/${mod}" "${SHARE_DIR}/${mod}"
+  install -m 0644 "${ROOT}/${mod}" "${BIN_DIR}/${mod}"
+done
 install -m 0755 "${ROOT}/window-arrange" "${BIN_DIR}/window-arrange"
 
 # Ensure ~/.local/bin is on PATH for this shell and future logins
@@ -47,10 +49,12 @@ cat >> "$tmp" <<'LUA'
 -- Super+J default is dwindle togglesplit — useless once windows are floating,
 -- maximized, or popped (the stacked mess on ultrawide / Surface Book). Rebind it.
 -- CLI: window-arrange   |   dry-run: window-arrange --dry-run
+-- Edit: window-arrange --edit  (drag-swap + edge/corner neighbor resize)
 -- Boot: window-arrange --on-start (waits for autostart apps, then arranges once)
 hl.unbind("SUPER + J")
 o.bind("SUPER + J", "Arrange windows (grid)", "window-arrange")
 o.bind("SUPER + ALT + A", "Arrange windows", "window-arrange")
+o.bind("SUPER + SHIFT + J", "Arrange windows (edit)", "window-arrange --edit")
 -- window-arrange:end
 LUA
 mv "$tmp" "$BIND_FILE"
@@ -90,10 +94,11 @@ if command -v hyprctl >/dev/null 2>&1 && [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}"
 fi
 
 echo "Installed: ${BIN_DIR}/window-arrange"
-echo "Layout:    ${SHARE_DIR}/layout.py"
-echo "Hotkeys:   Super+J  and  Super+Alt+A  (Mac host: Super+Option+J / A)"
+echo "Modules:   ${SHARE_DIR}/{layout,geometry,apply,editor}.py"
+echo "Hotkeys:   Super+J / Super+Alt+A arrange · Super+Shift+J edit"
 echo "Autostart: window-arrange --on-start  (via ~/.config/hypr/autostart.lua)"
 echo "Run:       window-arrange"
+echo "Edit:      window-arrange --edit"
 echo "Dry-run:   window-arrange --dry-run"
 echo "Boot wait: window-arrange --on-start"
-echo "Tests:     python3 -m unittest tests.test_layout -v"
+echo "Tests:     python3 -m unittest tests.test_layout tests.test_geometry -v"

@@ -7,6 +7,7 @@ Omarchy / Hyprland helper that tidies every window on the **active workspace**.
 - **Adaptive padding** — roomier gap/outer (~12/16 at reference density); override with env vars
 - **Even non-overlapping grid** — integer-split cells with true gutters; prefers browser-safe widths so min-size clamps cannot stack windows
 - **scrcpy / Pixel** stays a compact portrait strip on the right
+- **Interactive edit** — drag windows to swap cells; drag edges/corners to resize and push neighbors (i3-style gutters stay put)
 - Works with Hyprland 0.56+ Lua dispatchers (`hl.dsp.window.*`)
 
 ## Install (other Omarchy machine)
@@ -27,12 +28,15 @@ Manual:
 
 ```bash
 install -m 0755 window-arrange ~/.local/bin/window-arrange
-install -m 0644 layout.py ~/.local/bin/layout.py
-install -m 0644 layout.py ~/.local/share/window-arrange/layout.py
+for m in layout.py geometry.py apply.py editor.py; do
+  install -m 0644 "$m" ~/.local/bin/"$m"
+  install -m 0644 "$m" ~/.local/share/window-arrange/"$m"
+done
 # optional hotkeys in ~/.config/hypr/bindings.lua:
 #   hl.unbind("SUPER + J")
 #   o.bind("SUPER + J", "Arrange windows (grid)", "window-arrange")
 #   o.bind("SUPER + ALT + A", "Arrange windows", "window-arrange")
+#   o.bind("SUPER + SHIFT + J", "Arrange windows (edit)", "window-arrange --edit")
 # optional boot hook in ~/.config/hypr/autostart.lua:
 #   o.exec_on_start("window-arrange --on-start")
 ```
@@ -55,6 +59,7 @@ Typical wall time on 5–6 windows: **~5–20ms** eval. No focus cycling, no sle
 ```bash
 window-arrange              # apply layout
 window-arrange --dry-run    # print plan only
+window-arrange --edit       # interactive drag-swap + neighbor resize overlay
 window-arrange --on-start   # wait for autostart apps, then arrange once
 ```
 
@@ -62,7 +67,20 @@ window-arrange --on-start   # wait for autostart apps, then arrange once
 |--------|----------|----------------|
 | Arrange windows (grid) | **Super+J** | **Super+Option+J** |
 | Arrange windows (alias) | **Super+Alt+A** | **Super+Option+A** |
+| Edit layout (drag/resize) | **Super+Shift+J** | **Super+Shift+Option+J** |
 | Arrange after boot apps | autostart | `window-arrange --on-start` |
+
+### Interactive editor
+
+`window-arrange --edit` opens a full-monitor overlay (GTK4 layer-shell):
+
+- **Drag a window's body** onto another window → **swap** their cells
+- **Drag an edge or corner** → grow/shrink that side; **abutting neighbors move with it** so the gap stays empty (no overlap, no orphan strip)
+- **Enter** or **Apply** commits via the same `hyprctl eval` path as the one-shot arranger
+- **Esc** / **Cancel** / right-click discards
+- **R** re-reads live window geometries
+
+Requires `gtk4` + `gtk4-layer-shell` (both ship on Omarchy).
 
 ## Environment
 
@@ -89,7 +107,7 @@ WINDOW_ARRANGE_ON_START_WAIT=12 window-arrange --on-start
 ## Tests
 
 ```bash
-python3 -m unittest tests.test_layout -v
+python3 -m unittest tests.test_layout tests.test_geometry -v
 ```
 
 Coverage includes HiDPI fractional scale (physical 2256x1504 @ 1.5667 → logical 1440x960) and scale-1.0 Mac-like canvases so placements stay on-screen on both.
@@ -99,6 +117,7 @@ Coverage includes HiDPI fractional scale (physical 2256x1504 @ 1.5667 → logica
 - [Omarchy](https://omarchy.org) (or Hyprland with `hyprctl`)
 - `python3`
 - `hyprctl` on `PATH`
+- Interactive editor: `gtk4`, `gtk4-layer-shell`, `python-gobject`
 - Optional: `omarchy-notification-send` / `notify-send`
 
 ## License
