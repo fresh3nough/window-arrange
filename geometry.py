@@ -7,6 +7,11 @@ tested. Windows are axis-aligned rects in logical pixels: {id, x, y, w, h, ...}.
 Resize keeps the gutter between neighbors: dragging an edge grows one window
 and shrinks every abutting neighbor on that edge in the same motion (i3-style
 split adjust). Corners combine the two axes.
+
+After any resize the layout is guaranteed free of interior overlaps: free-edge
+growth is clamped against non-neighbor obstacles (and work-area bounds) so a
+tile cannot slide into another cell. Bounds clamping never shifts the opposite
+edge of a window (that was the classic "clamp → overlap" bug).
 """
 
 from __future__ import annotations
@@ -42,9 +47,43 @@ def clone_windows(windows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def rects_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    """True when interiors intersect. Touching edges (share a line) is OK."""
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
     return ax < bx + bw and ax + aw > bx and ay < by + bh and ay + ah > by
+
+
+def any_overlaps(
+    windows: list[dict[str, Any]],
+) -> list[tuple[int, int, tuple[int, int, int, int], tuple[int, int, int, int]]]:
+    """Return every pair of overlapping window indices with their rects."""
+    bad: list[tuple[int, int, tuple[int, int, int, int], tuple[int, int, int, int]]] = []
+    for i in range(len(windows)):
+        ai = _as_rect(windows[i])
+        for j in range(i + 1, len(windows)):
+            bj = _as_rect(windows[j])
+            if rects_overlap(ai, bj):
+                bad.append((i, j, ai, bj))
+    return bad
+
+
+def layout_is_valid(
+    windows: list[dict[str, Any]],
+    bounds: tuple[int, int, int, int] | None = None,
+    *,
+    min_w: int = DEFAULT_MIN_W,
+    min_h: int = DEFAULT_MIN_H,
+) -> bool:
+    """No interior overlaps, every tile >= min size, optionally inside bounds."""
+    for w in windows:
+        if int(w["w"]) < min_w or int(w["h"]) < min_h:
+            return False
+        if bounds is not None:
+            x0, y0, x1, y1 = bounds
+            x, y, ww, hh = _as_rect(w)
+            if x < x0 or y < y0 or x + ww > x1 or y + hh > y1:
+                return False
+    return not any_overlaps(windows)
 
 
 def interval_overlap(a0: int, a1: int, b0: int, b1: int) -> int:
@@ -112,8 +151,6 @@ def _clamp_delta_grow(
     if delta > 0 and neighbor_sizes:
         max_shrink = min(s - min_size for s in neighbor_sizes)
         delta = min(delta, max(0, max_shrink))
-    # Neighbors grow when delta < 0 — no upper bound from neighbors.
-    # Primary grows when delta > 0 — no upper bound here (bounds box handles it).
     return delta
 
 
@@ -140,48 +177,17 @@ def _clamp_delta_shrink_primary_grows_on_neg(
     return delta
 
 
-def resize_edge(
-    windows: list[dict[str, Any]],
+def _apply_edge_delta(
+    out: list[dict[str, Any]],
     index: int,
     edge: Edge,
     delta: int,
-    *,
-    gap: int = DEFAULT_GAP,
-    min_w: int = DEFAULT_MIN_W,
-    min_h: int = DEFAULT_MIN_H,
-    bounds: tuple[int, int, int, int] | None = None,
-) -> list[dict[str, Any]]:
-    """Return a new window list after dragging `edge` of `index` by `delta` px.
-
-    Neighbors that abut across `gap` share the delta so the gutter stays put
-    and no gap opens between tiles. `bounds` is (x0, y0, x1, y1) exclusive-ish
-    work-area limits; when set, motion that would push a rect outside is cut.
-    """
-    if delta == 0 or index < 0 or index >= len(windows):
-        return clone_windows(windows)
-
-    out = clone_windows(windows)
-    src = out[index]
-    neighbors = find_neighbors(out, index, edge, gap=gap)
-
-    if edge in ("left", "right"):
-        min_size = min_w
-        sizes = [out[j]["w"] for j in neighbors]
-        if edge == "right":
-            delta = _clamp_delta_grow(src["w"], sizes, delta, min_size)
-        else:
-            delta = _clamp_delta_shrink_primary_grows_on_neg(src["w"], sizes, delta, min_size)
-    else:
-        min_size = min_h
-        sizes = [out[j]["h"] for j in neighbors]
-        if edge == "bottom":
-            delta = _clamp_delta_grow(src["h"], sizes, delta, min_size)
-        else:
-            delta = _clamp_delta_shrink_primary_grows_on_neg(src["h"], sizes, delta, min_size)
-
+    neighbors: list[int],
+) -> None:
+    """Mutate `out` applying an already-clamped edge delta."""
     if delta == 0:
-        return out
-
+        return
+    src = out[index]
     if edge == "right":
         src["w"] = int(src["w"] + delta)
         for j in neighbors:
@@ -207,8 +213,190 @@ def resize_edge(
             n = out[j]
             n["h"] = int(n["h"] + delta)
 
-    if bounds is not None:
-        out = _clamp_all_to_bounds(out, bounds, min_w=min_w, min_h=min_h)
+
+def _max_free_growth(
+    windows: list[dict[str, Any]],
+    index: int,
+    edge: Edge,
+    gap: int,
+    bounds: tuple[int, int, int, int] | None,
+    ignore: set[int],
+) -> int:
+    """How many px the free edge of `index` can grow before hitting an obstacle.
+
+    Obstacles are any window not in `ignore` (typically the primary + its
+    abutting neighbors already being resized) plus the work-area bound.
+    Gap is reserved between the growing edge and any obstacle.
+    """
+    src = windows[index]
+    sx, sy, sw, sh = _as_rect(src)
+    gap = max(0, int(gap))
+    limit = 10**9
+
+    if edge == "right":
+        if bounds is not None:
+            limit = min(limit, bounds[2] - (sx + sw))
+        for j, other in enumerate(windows):
+            if j in ignore:
+                continue
+            ox, oy, ow, oh = _as_rect(other)
+            # Obstacle starts to the right and vertically overlaps.
+            if ox >= sx + sw and _vert_overlap(src, other) > 0:
+                limit = min(limit, ox - gap - (sx + sw))
+    elif edge == "left":
+        # Growth on left means decreasing x (negative delta). Return max |delta|.
+        if bounds is not None:
+            limit = min(limit, sx - bounds[0])
+        for j, other in enumerate(windows):
+            if j in ignore:
+                continue
+            ox, oy, ow, oh = _as_rect(other)
+            if ox + ow <= sx and _vert_overlap(src, other) > 0:
+                limit = min(limit, sx - gap - (ox + ow))
+    elif edge == "bottom":
+        if bounds is not None:
+            limit = min(limit, bounds[3] - (sy + sh))
+        for j, other in enumerate(windows):
+            if j in ignore:
+                continue
+            ox, oy, ow, oh = _as_rect(other)
+            if oy >= sy + sh and _horiz_overlap(src, other) > 0:
+                limit = min(limit, oy - gap - (sy + sh))
+    elif edge == "top":
+        if bounds is not None:
+            limit = min(limit, sy - bounds[1])
+        for j, other in enumerate(windows):
+            if j in ignore:
+                continue
+            ox, oy, ow, oh = _as_rect(other)
+            if oy + oh <= sy and _horiz_overlap(src, other) > 0:
+                limit = min(limit, sy - gap - (oy + oh))
+    return max(0, int(limit))
+
+
+def _max_neighbor_outward_growth(
+    windows: list[dict[str, Any]],
+    neighbors: list[int],
+    edge: Edge,
+    gap: int,
+    bounds: tuple[int, int, int, int] | None,
+    ignore: set[int],
+) -> int:
+    """When primary shrinks, neighbors grow outward; clamp by their free space."""
+    if not neighbors:
+        return 10**9
+    # Neighbor grows on the side opposite the shared edge.
+    grow_edge: Edge = {
+        "right": "left",   # neighbor sits to the right; grows leftward into freed gap? No —
+        # Actually for right-edge shrink (delta<0): neighbor x decreases? Wait.
+        # right edge delta<0: src.w decreases; neighbor: x += delta (moves left), w -= delta (grows).
+        # Neighbor's LEFT edge moves left — free growth is toward the primary, already
+        # accounted by the shared gutter. The neighbor's RIGHT edge stays put.
+        # So no outward obstacle check needed for the classic abutting case.
+        #
+        # EXCEPT when primary shrinks on left edge (delta>0): neighbor grows its right
+        # (n.w += delta) while n.x stays — neighbor expands rightward. That CAN hit
+        # something to the right of the neighbor.
+        "left": "right",
+        "bottom": "top",
+        "top": "bottom",
+    }[edge]
+
+    # Only the cases where neighbor expands away from the primary need a check:
+    # left-edge positive delta → neighbors grow right
+    # right-edge negative delta → neighbors grow left (their x moves, right edge fixed) — OK
+    # top-edge positive delta → neighbors grow bottom
+    # bottom-edge negative delta → neighbors grow top — OK
+    if edge in ("right", "bottom"):
+        # Neighbors grow toward primary (inward). Right/bottom edge of neighbor fixed.
+        return 10**9
+
+    limit = 10**9
+    for j in neighbors:
+        # How far can neighbor j grow on grow_edge?
+        limit = min(
+            limit,
+            _max_free_growth(windows, j, grow_edge, gap, bounds, ignore),
+        )
+    return max(0, int(limit))
+
+
+def resize_edge(
+    windows: list[dict[str, Any]],
+    index: int,
+    edge: Edge,
+    delta: int,
+    *,
+    gap: int = DEFAULT_GAP,
+    min_w: int = DEFAULT_MIN_W,
+    min_h: int = DEFAULT_MIN_H,
+    bounds: tuple[int, int, int, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Return a new window list after dragging `edge` of `index` by `delta` px.
+
+    Neighbors that abut across `gap` share the delta so the gutter stays put
+    and no gap opens between tiles. Free-edge growth is clamped against
+    non-neighbor obstacles and `bounds` so cells never overlap. Unlike a naive
+    post-hoc bounds clamp, the opposite edge of every window stays fixed.
+    """
+    if delta == 0 or index < 0 or index >= len(windows):
+        return clone_windows(windows)
+
+    out = clone_windows(windows)
+    src = out[index]
+    neighbors = find_neighbors(out, index, edge, gap=gap)
+    ignore = {index, *neighbors}
+
+    if edge in ("left", "right"):
+        min_size = min_w
+        sizes = [out[j]["w"] for j in neighbors]
+        if edge == "right":
+            delta = _clamp_delta_grow(src["w"], sizes, delta, min_size)
+            if delta > 0:
+                # Growing primary right: blocked by free-space obstacles.
+                free = _max_free_growth(out, index, "right", gap, bounds, ignore)
+                delta = min(delta, free)
+            # delta < 0 shrinks primary; neighbors grow left (inward) — safe.
+        else:
+            delta = _clamp_delta_shrink_primary_grows_on_neg(src["w"], sizes, delta, min_size)
+            if delta < 0:
+                # Growing primary left.
+                free = _max_free_growth(out, index, "left", gap, bounds, ignore)
+                delta = max(delta, -free)
+            elif delta > 0:
+                # Shrinking primary; neighbors grow right — clamp by their free space.
+                free = _max_neighbor_outward_growth(
+                    out, neighbors, "left", gap, bounds, ignore
+                )
+                delta = min(delta, free)
+    else:
+        min_size = min_h
+        sizes = [out[j]["h"] for j in neighbors]
+        if edge == "bottom":
+            delta = _clamp_delta_grow(src["h"], sizes, delta, min_size)
+            if delta > 0:
+                free = _max_free_growth(out, index, "bottom", gap, bounds, ignore)
+                delta = min(delta, free)
+        else:
+            delta = _clamp_delta_shrink_primary_grows_on_neg(src["h"], sizes, delta, min_size)
+            if delta < 0:
+                free = _max_free_growth(out, index, "top", gap, bounds, ignore)
+                delta = max(delta, -free)
+            elif delta > 0:
+                free = _max_neighbor_outward_growth(
+                    out, neighbors, "top", gap, bounds, ignore
+                )
+                delta = min(delta, free)
+
+    if delta == 0:
+        return out
+
+    _apply_edge_delta(out, index, edge, delta, neighbors)
+
+    # Safety net: if anything still overlaps (floating junk, weird geometry),
+    # refuse the motion and return the pre-drag layout.
+    if not layout_is_valid(out, bounds, min_w=min_w, min_h=min_h):
+        return clone_windows(windows)
     return out
 
 
@@ -240,37 +428,35 @@ def resize_handle(
     elif handle in ("bottom", "bottom-left", "bottom-right"):
         v_edge = "bottom"
 
+    # Apply axes sequentially from the original snapshot so each axis sees a
+    # consistent neighbor set. If the combined result is invalid, try each axis
+    # alone and keep the best valid partial.
+    candidate = out
     if h_edge is not None and dx:
-        out = resize_edge(
-            out, index, h_edge, dx, gap=gap, min_w=min_w, min_h=min_h, bounds=None
+        candidate = resize_edge(
+            candidate, index, h_edge, dx, gap=gap, min_w=min_w, min_h=min_h, bounds=bounds
         )
     if v_edge is not None and dy:
-        out = resize_edge(
-            out, index, v_edge, dy, gap=gap, min_w=min_w, min_h=min_h, bounds=None
+        candidate = resize_edge(
+            candidate, index, v_edge, dy, gap=gap, min_w=min_w, min_h=min_h, bounds=bounds
         )
-    if bounds is not None:
-        out = _clamp_all_to_bounds(out, bounds, min_w=min_w, min_h=min_h)
-    return out
 
+    if layout_is_valid(candidate, bounds, min_w=min_w, min_h=min_h):
+        return candidate
 
-def _clamp_all_to_bounds(
-    windows: list[dict[str, Any]],
-    bounds: tuple[int, int, int, int],
-    *,
-    min_w: int,
-    min_h: int,
-) -> list[dict[str, Any]]:
-    x0, y0, x1, y1 = bounds
-    out = clone_windows(windows)
-    for w in out:
-        w["w"] = max(min_w, min(int(w["w"]), max(min_w, x1 - x0)))
-        w["h"] = max(min_h, min(int(w["h"]), max(min_h, y1 - y0)))
-        w["x"] = min(max(int(w["x"]), x0), max(x0, x1 - w["w"]))
-        w["y"] = min(max(int(w["y"]), y0), max(y0, y1 - w["h"]))
-        if w["x"] + w["w"] > x1:
-            w["w"] = max(min_w, x1 - w["x"])
-        if w["y"] + w["h"] > y1:
-            w["h"] = max(min_h, y1 - w["y"])
+    # Combined move failed — try horizontal only, then vertical only.
+    if h_edge is not None and dx:
+        only_h = resize_edge(
+            out, index, h_edge, dx, gap=gap, min_w=min_w, min_h=min_h, bounds=bounds
+        )
+        if layout_is_valid(only_h, bounds, min_w=min_w, min_h=min_h):
+            return only_h
+    if v_edge is not None and dy:
+        only_v = resize_edge(
+            out, index, v_edge, dy, gap=gap, min_w=min_w, min_h=min_h, bounds=bounds
+        )
+        if layout_is_valid(only_v, bounds, min_w=min_w, min_h=min_h):
+            return only_v
     return out
 
 
@@ -301,7 +487,6 @@ def hit_test_handle(
     Topmost (highest index) window wins when rects overlap — unusual for a grid
     but keeps the editor predictable if the user stacked floats beforehand.
     """
-    # Iterate front-to-back: last drawn / highest z. We don't track z; use reverse order.
     for i in range(len(windows) - 1, -1, -1):
         w = windows[i]
         x, y, ww, hh = _as_rect(w)
@@ -311,7 +496,6 @@ def hit_test_handle(
         right = (x + ww) - px <= corner_px
         top = py - y <= corner_px
         bottom = (y + hh) - py <= corner_px
-        # Corners first (use corner_px).
         if top and left:
             return i, "top-left"
         if top and right:
@@ -320,7 +504,6 @@ def hit_test_handle(
             return i, "bottom-left"
         if bottom and right:
             return i, "bottom-right"
-        # Edges (thinner strip is fine once corners ruled out).
         if px - x <= handle_px:
             return i, "left"
         if (x + ww) - px <= handle_px:

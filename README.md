@@ -20,9 +20,11 @@ cd window-arrange
 bash install.sh
 ```
 
-`install.sh` puts the binary and `layout.py` on `~/.local/bin` (and a copy under `~/.local/share/window-arrange`), rebinds **Super+J** (replaces dwindle togglesplit), binds **Super+Alt+A**, and hooks **`window-arrange --on-start`** into `~/.config/hypr/autostart.lua` so the grid runs after autoload apps map.
+`install.sh` puts the binary and modules on `~/.local/bin` (and a copy under `~/.local/share/window-arrange`), rebinds **Super+J** (replaces dwindle togglesplit), binds **Super+B** for the interactive editor, binds **Super+Alt+A**, and hooks **`window-arrange --on-start`** into `~/.config/hypr/autostart.lua` so the grid runs after autoload apps map.
 
 Why Super+J: default Omarchy `togglesplit` only flips already-tiled dwindle leaves. Floated / popped / maximized windows ignore it and keep stacking — the usual ultrawide / Surface Book mess. Arrange always re-packs the free work area as a responsive grid instead.
+
+Why Super+B for edit: free on stock Omarchy (browser is **Super+Shift+B**).
 
 Manual:
 
@@ -36,7 +38,7 @@ done
 #   hl.unbind("SUPER + J")
 #   o.bind("SUPER + J", "Arrange windows (grid)", "window-arrange")
 #   o.bind("SUPER + ALT + A", "Arrange windows", "window-arrange")
-#   o.bind("SUPER + SHIFT + J", "Arrange windows (edit)", "window-arrange --edit")
+#   o.bind("SUPER + B", "Arrange windows (edit)", "window-arrange --edit")
 # optional boot hook in ~/.config/hypr/autostart.lua:
 #   o.exec_on_start("window-arrange --on-start")
 ```
@@ -67,20 +69,21 @@ window-arrange --on-start   # wait for autostart apps, then arrange once
 |--------|----------|----------------|
 | Arrange windows (grid) | **Super+J** | **Super+Option+J** |
 | Arrange windows (alias) | **Super+Alt+A** | **Super+Option+A** |
-| Edit layout (drag/resize) | **Super+Shift+J** | **Super+Shift+Option+J** |
+| Edit layout (drag/resize live) | **Super+B** | **Super+Option+B** |
 | Arrange after boot apps | autostart | `window-arrange --on-start` |
 
 ### Interactive editor
 
-`window-arrange --edit` opens a full-monitor overlay (GTK4 layer-shell):
+`window-arrange --edit` opens a **transparent** full-monitor overlay (GTK4 layer-shell) so the real desktop stays visible:
 
-- **Drag a window's body** onto another window → **swap** their cells
-- **Drag an edge or corner** → grow/shrink that side; **abutting neighbors move with it** so the gap stays empty (no overlap, no orphan strip)
-- **Enter** or **Apply** commits via the same `hyprctl eval` path as the one-shot arranger
-- **Esc** / **Cancel** / right-click discards
+- **Drag a window's body** onto another window → **swap** their cells (applied immediately)
+- **Drag an edge or corner** → grow/shrink that side; **abutting neighbors move with it** and real windows **resize live under the outline** (no white wash, no wait-for-Apply)
+- Free-edge growth stops at non-neighbor obstacles and the work-area bound — cells never overlap
+- **Enter** / **Done** keeps the live layout and closes
+- **Esc** / **Cancel** / right-click **restores** the snapshot from when the editor opened
 - **R** re-reads live window geometries
 
-Requires `gtk4` + `gtk4-layer-shell` (both ship on Omarchy).
+Requires `gtk4` + `gtk4-layer-shell` + `python-gobject`. On Arch/Omarchy: `sudo pacman -S gtk4-layer-shell`.
 
 ## Environment
 

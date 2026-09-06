@@ -3,10 +3,12 @@
 
 GTK4 + gtk4-layer-shell overlay on the focused monitor:
 
-  - Drag a window body onto another → swap their cells
-  - Drag edges / corners → resize, pushing abutting neighbors so gutters stay
-  - Enter / click Apply → commit geometries via hyprctl
-  - Esc / click Cancel → quit without changes
+  - Transparent chrome — desktop and live windows stay visible underneath
+  - Drag a window body onto another → swap their cells (applied live)
+  - Drag edges / corners → resize, pushing abutting neighbors; applied live
+    so real windows move under the outline in real time
+  - Enter / click Done → quit keeping the live layout
+  - Esc / click Cancel → restore the snapshot taken at editor open
   - R → re-snapshot live window positions
 
 Coordinates are Hyprland logical pixels (same space as layout.py).
@@ -42,6 +44,7 @@ def _ensure_layer_shell_preload() -> None:
     env["WINDOW_ARRANGE_LAYER_PRELOAD"] = "1"
     os.execve(sys.executable, [sys.executable, *sys.argv], env)
 
+
 _ensure_layer_shell_preload()
 
 # Repo-local imports (also works when installed next to layout.py).
@@ -58,6 +61,7 @@ from geometry import (  # noqa: E402
     clone_windows,
     cursor_for_handle,
     hit_test_handle,
+    layout_is_valid,
     resize_handle,
     swap_windows,
     window_at,
@@ -74,17 +78,23 @@ from gi.repository import Gdk, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
 
 
-# Palette — readable on both light and dark wallpapers.
-COL_DIM = (0.10, 0.12, 0.16, 0.55)
-COL_TILE = (0.22, 0.45, 0.78, 0.42)
-COL_TILE_BORDER = (0.55, 0.78, 1.0, 0.95)
-COL_ACTIVE = (0.95, 0.70, 0.20, 0.50)
+# Palette — translucent outlines over the real desktop (no white wash).
+COL_TILE_FILL = (0.18, 0.42, 0.78, 0.10)
+COL_TILE_BORDER = (0.55, 0.82, 1.0, 0.85)
+COL_ACTIVE_FILL = (0.95, 0.70, 0.20, 0.16)
 COL_ACTIVE_BORDER = (1.0, 0.85, 0.35, 1.0)
-COL_SWAP = (0.30, 0.78, 0.45, 0.50)
+COL_SWAP_FILL = (0.25, 0.80, 0.45, 0.18)
 COL_SWAP_BORDER = (0.45, 1.0, 0.60, 1.0)
-COL_HANDLE = (1.0, 1.0, 1.0, 0.85)
+COL_HOVER_FILL = (0.30, 0.55, 0.90, 0.14)
+COL_HANDLE = (1.0, 1.0, 1.0, 0.90)
 COL_TEXT = (1.0, 1.0, 1.0, 0.95)
-COL_HINT_BG = (0.08, 0.09, 0.12, 0.82)
+COL_TEXT_SHADOW = (0.0, 0.0, 0.0, 0.55)
+COL_HINT_BG = (0.06, 0.07, 0.10, 0.78)
+COL_GHOST = (1.0, 1.0, 1.0, 0.12)
+COL_WORKAREA = (1.0, 1.0, 1.0, 0.14)
+
+# Live-apply throttle while dragging (ms). Hyprland eval is ~5–20ms.
+LIVE_APPLY_MS = 16
 
 
 def _gap_from_env_or_meta(windows: list[dict[str, Any]]) -> int:
@@ -94,7 +104,6 @@ def _gap_from_env_or_meta(windows: list[dict[str, Any]]) -> int:
             return max(0, int(raw))
         except ValueError:
             pass
-    # Prefer gap recorded on a prior arrange plan if present.
     for w in windows:
         meta = w.get("meta") or {}
         if "gap" in meta:
@@ -112,8 +121,34 @@ def _outer_from_env() -> int | None:
         return None
 
 
+def _plan_from_windows(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "address": w["address"],
+            "class": w.get("class") or "",
+            "role": w.get("role") or "grid",
+            "mode": "float",
+            "x": int(w["x"]),
+            "y": int(w["y"]),
+            "w": int(w["w"]),
+            "h": int(w["h"]),
+            "fullscreen": w.get("fullscreen") not in (0, False, None),
+            "floating": bool(w.get("floating", True)),
+            "pinned": bool(w.get("pinned")),
+        }
+        for w in windows
+    ]
+
+
+def _geom_signature(windows: list[dict[str, Any]]) -> tuple:
+    return tuple(
+        (w.get("address"), int(w["x"]), int(w["y"]), int(w["w"]), int(w["h"]))
+        for w in windows
+    )
+
+
 class ArrangeCanvas(Gtk.DrawingArea):
-    """Full-monitor drawing surface that owns drag state."""
+    """Full-monitor drawing surface that owns drag state + live apply."""
 
     def __init__(
         self,
@@ -121,18 +156,19 @@ class ArrangeCanvas(Gtk.DrawingArea):
         bounds: tuple[int, int, int, int],
         mon_origin: tuple[int, int],
         gap: int,
-        on_apply,
+        on_done,
         on_cancel,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.windows = clone_windows(windows)
+        self.initial_windows = clone_windows(windows)
         self.bounds = bounds  # global logical (x0,y0,x1,y1)
         self.mon_origin = mon_origin  # (mx, my) global logical
         self.gap = gap
         self.min_w = DEFAULT_MIN_W
         self.min_h = DEFAULT_MIN_H
-        self.on_apply = on_apply
+        self.on_done = on_done
         self.on_cancel = on_cancel
 
         self._drag_index: int | None = None
@@ -142,8 +178,13 @@ class ArrangeCanvas(Gtk.DrawingArea):
         self._hover_handle: str | None = None
         self._hover_index: int | None = None
         self._swap_target: int | None = None
-        self._ghost_xy: tuple[float, float] | None = None  # local pointer during body drag
+        self._ghost_xy: tuple[float, float] | None = None
+        self._last_applied_sig: tuple | None = _geom_signature(self.windows)
+        self._live_pending = False
+        self._live_source: int | None = None
+        self._applying = False
 
+        # Transparent surface — no opaque default background.
         self.set_draw_func(self._on_draw)
         self.set_cursor(Gdk.Cursor.new_from_name("default"))
 
@@ -182,6 +223,53 @@ class ArrangeCanvas(Gtk.DrawingArea):
         mx, my = self.mon_origin
         return w["x"] - mx, w["y"] - my, float(w["w"]), float(w["h"])
 
+    # --- live apply ---------------------------------------------------------
+
+    def _schedule_live_apply(self) -> None:
+        """Coalesce hyprctl applies so drag stays smooth."""
+        self._live_pending = True
+        if self._live_source is not None:
+            return
+
+        def _tick() -> bool:
+            if not self._live_pending:
+                self._live_source = None
+                return False
+            self._live_pending = False
+            self._flush_live_apply()
+            # Keep the timer if another frame arrived during apply.
+            if self._live_pending:
+                return True
+            self._live_source = None
+            return False
+
+        self._live_source = GLib.timeout_add(LIVE_APPLY_MS, _tick)
+
+    def _flush_live_apply(self) -> None:
+        if self._applying:
+            self._live_pending = True
+            return
+        sig = _geom_signature(self.windows)
+        if sig == self._last_applied_sig:
+            return
+        if not layout_is_valid(
+            self.windows, self.bounds, min_w=self.min_w, min_h=self.min_h
+        ):
+            return
+        self._applying = True
+        try:
+            result = apply_plan(_plan_from_windows(self.windows), refresh_clients=False)
+            if not result.get("error"):
+                self._last_applied_sig = sig
+        finally:
+            self._applying = False
+
+    def _apply_now(self, windows: list[dict[str, Any]]) -> dict[str, Any]:
+        result = apply_plan(_plan_from_windows(windows), refresh_clients=True)
+        if not result.get("error"):
+            self._last_applied_sig = _geom_signature(windows)
+        return result
+
     # --- input --------------------------------------------------------------
 
     def _on_key(self, _ctrl, keyval, _keycode, _state) -> bool:
@@ -189,7 +277,7 @@ class ArrangeCanvas(Gtk.DrawingArea):
             self.on_cancel()
             return True
         if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
-            self.on_apply(self.windows)
+            self.on_done(self.windows)
             return True
         if keyval in (Gdk.KEY_r, Gdk.KEY_R):
             self._resnap()
@@ -199,6 +287,8 @@ class ArrangeCanvas(Gtk.DrawingArea):
     def _resnap(self) -> None:
         try:
             self.windows = snapshot_workspace_windows()
+            self.initial_windows = clone_windows(self.windows)
+            self._last_applied_sig = _geom_signature(self.windows)
         except Exception:
             pass
         self._drag_index = None
@@ -217,9 +307,6 @@ class ArrangeCanvas(Gtk.DrawingArea):
         else:
             self._hover_index, self._hover_handle = hit
             name = cursor_for_handle(self._hover_handle)
-            # grab → grabbing while idle body hover still reads as move.
-            if name == "grab":
-                name = "grab"
             cur = Gdk.Cursor.new_from_name(name) or Gdk.Cursor.new_from_name("default")
             self.set_cursor(cur)
         self.queue_draw()
@@ -235,7 +322,6 @@ class ArrangeCanvas(Gtk.DrawingArea):
         if button == 3:  # right-click cancel
             self.on_cancel()
             return
-        # Left click on empty chrome does nothing; focus for keys.
         self.grab_focus()
 
     def _on_released(self, gesture: Gtk.GestureClick, _n, x, y) -> None:
@@ -273,12 +359,12 @@ class ArrangeCanvas(Gtk.DrawingArea):
         handle = self._drag_handle or "body"
 
         if handle == "body":
-            # Preview swap target under cursor (not the dragged window).
             gx, gy = self._to_global(cx, cy)
             self.windows = clone_windows(self._drag_origin_windows)
             self._swap_target = window_at(
                 self.windows, gx, gy, exclude=self._drag_index
             )
+            # Body drag only previews swap; apply happens on release.
         else:
             self.windows = resize_handle(
                 self._drag_origin_windows,
@@ -292,6 +378,7 @@ class ArrangeCanvas(Gtk.DrawingArea):
                 bounds=self.bounds,
             )
             self._swap_target = None
+            self._schedule_live_apply()
         self.queue_draw()
 
     def _on_drag_end(self, _gesture, offset_x: float, offset_y: float) -> None:
@@ -311,13 +398,14 @@ class ArrangeCanvas(Gtk.DrawingArea):
                     self.windows = swap_windows(
                         self._drag_origin_windows, self._drag_index, target
                     )
+                    self._apply_now(self.windows)
                 else:
                     self.windows = clone_windows(self._drag_origin_windows)
             else:
                 self.windows = clone_windows(self._drag_origin_windows)
         else:
-            # Keep the last resize result already in self.windows.
-            pass
+            # Final live apply so the last pixel lands.
+            self._flush_live_apply()
         self._reset_drag()
         self.queue_draw()
 
@@ -333,17 +421,23 @@ class ArrangeCanvas(Gtk.DrawingArea):
     # --- drawing ------------------------------------------------------------
 
     def _on_draw(self, _area, cr, width: int, height: int) -> None:
-        # Dim the desktop so tiles read clearly.
-        cr.set_source_rgba(*COL_DIM)
-        cr.rectangle(0, 0, width, height)
-        cr.fill()
+        # Fully transparent backdrop — real windows show through.
+        try:
+            from cairo import OPERATOR_CLEAR, OPERATOR_OVER
 
-        # Work-area outline.
+            cr.set_operator(OPERATOR_CLEAR)
+            cr.paint()
+            cr.set_operator(OPERATOR_OVER)
+        except Exception:
+            # Fallback: paint nothing (rely on CSS transparent window bg).
+            pass
+
+        # Work-area outline only (no dim wash).
         x0, y0, x1, y1 = self.bounds
         mx, my = self.mon_origin
-        cr.set_source_rgba(1, 1, 1, 0.18)
+        cr.set_source_rgba(*COL_WORKAREA)
         cr.set_line_width(1.5)
-        cr.rectangle(x0 - mx, y0 - my, x1 - x0, y1 - y0)
+        cr.rectangle(x0 - mx + 0.5, y0 - my + 0.5, x1 - x0 - 1, y1 - y0 - 1)
         cr.stroke()
 
         for i, w in enumerate(self.windows):
@@ -358,7 +452,6 @@ class ArrangeCanvas(Gtk.DrawingArea):
         ):
             src = self._drag_origin_windows[self._drag_index]
             gx, gy = self._ghost_xy
-            # Center ghost under pointer relative to original grab offset if possible.
             if self._drag_start_local is not None:
                 ox, oy = self._to_local_rect(src)[:2]
                 grab_dx = self._drag_start_local[0] - ox
@@ -368,7 +461,7 @@ class ArrangeCanvas(Gtk.DrawingArea):
                 grab_dy = src["h"] / 2
             rx = gx - grab_dx
             ry = gy - grab_dy
-            cr.set_source_rgba(1, 1, 1, 0.20)
+            cr.set_source_rgba(*COL_GHOST)
             self._round_rect(cr, rx, ry, src["w"], src["h"], 10)
             cr.fill()
             cr.set_source_rgba(*COL_ACTIVE_BORDER)
@@ -385,15 +478,15 @@ class ArrangeCanvas(Gtk.DrawingArea):
         is_hover = self._hover_index == index and self._drag_index is None
 
         if is_swap:
-            fill, border = COL_SWAP, COL_SWAP_BORDER
+            fill, border = COL_SWAP_FILL, COL_SWAP_BORDER
         elif is_drag and self._drag_handle != "body":
-            fill, border = COL_ACTIVE, COL_ACTIVE_BORDER
+            fill, border = COL_ACTIVE_FILL, COL_ACTIVE_BORDER
         elif is_drag and self._drag_handle == "body":
-            fill, border = (0.22, 0.45, 0.78, 0.22), (0.55, 0.78, 1.0, 0.45)
+            fill, border = (0.22, 0.45, 0.78, 0.06), (0.55, 0.78, 1.0, 0.40)
         elif is_hover:
-            fill, border = (0.28, 0.52, 0.85, 0.50), COL_TILE_BORDER
+            fill, border = COL_HOVER_FILL, COL_TILE_BORDER
         else:
-            fill, border = COL_TILE, COL_TILE_BORDER
+            fill, border = COL_TILE_FILL, COL_TILE_BORDER
 
         cr.set_source_rgba(*fill)
         self._round_rect(cr, lx, ly, lw, lh, 10)
@@ -409,21 +502,16 @@ class ArrangeCanvas(Gtk.DrawingArea):
         mid_x = lx + lw / 2
         mid_y = ly + lh / 2
         tick = 18
-        # top
         cr.move_to(mid_x - tick / 2, ly + 5)
         cr.line_to(mid_x + tick / 2, ly + 5)
-        # bottom
         cr.move_to(mid_x - tick / 2, ly + lh - 5)
         cr.line_to(mid_x + tick / 2, ly + lh - 5)
-        # left
         cr.move_to(lx + 5, mid_y - tick / 2)
         cr.line_to(lx + 5, mid_y + tick / 2)
-        # right
         cr.move_to(lx + lw - 5, mid_y - tick / 2)
         cr.line_to(lx + lw - 5, mid_y + tick / 2)
         cr.stroke()
 
-        # Corner dots.
         for cx, cy in (
             (lx + 6, ly + 6),
             (lx + lw - 6, ly + 6),
@@ -433,7 +521,6 @@ class ArrangeCanvas(Gtk.DrawingArea):
             cr.arc(cx, cy, 3.5, 0, 2 * math.pi)
             cr.fill()
 
-        # Label.
         label = (w.get("class") or w.get("title") or "window").strip() or "window"
         if len(label) > 28:
             label = label[:27] + "…"
@@ -448,9 +535,13 @@ class ArrangeCanvas(Gtk.DrawingArea):
         layout.set_width(int(max(20, lw - 24) * Pango.SCALE))
         layout.set_ellipsize(Pango.EllipsizeMode.END)
         tw, th = layout.get_pixel_size()
-        cr.set_source_rgba(*COL_TEXT)
         tx = lx + (lw - tw) / 2
         ty = ly + lh / 2 - th - 2
+        # Soft shadow so labels stay readable on light or dark windows.
+        cr.set_source_rgba(*COL_TEXT_SHADOW)
+        cr.move_to(tx + 1, ty + 1)
+        PangoCairo.show_layout(cr, layout)
+        cr.set_source_rgba(*COL_TEXT)
         cr.move_to(tx, ty)
         PangoCairo.show_layout(cr, layout)
 
@@ -459,14 +550,17 @@ class ArrangeCanvas(Gtk.DrawingArea):
         layout2.set_font_description(font2)
         layout2.set_text(sub, -1)
         tw2, th2 = layout2.get_pixel_size()
-        cr.set_source_rgba(1, 1, 1, 0.75)
+        cr.set_source_rgba(*COL_TEXT_SHADOW)
+        cr.move_to(lx + (lw - tw2) / 2 + 1, ly + lh / 2 + 5)
+        PangoCairo.show_layout(cr, layout2)
+        cr.set_source_rgba(1, 1, 1, 0.85)
         cr.move_to(lx + (lw - tw2) / 2, ly + lh / 2 + 4)
         PangoCairo.show_layout(cr, layout2)
 
     def _draw_hint_bar(self, cr, width: int, height: int) -> None:
         text = (
-            "Drag body to swap  ·  Drag edges/corners to resize neighbors  ·  "
-            "Enter apply  ·  Esc cancel  ·  R refresh"
+            "Drag body to swap  ·  Edges/corners resize live  ·  "
+            "Enter done  ·  Esc restore  ·  R refresh"
         )
         pad_x, pad_y = 18, 10
         layout = PangoCairo.create_layout(cr)
@@ -484,18 +578,16 @@ class ArrangeCanvas(Gtk.DrawingArea):
         cr.move_to(bx + pad_x, by + pad_y)
         PangoCairo.show_layout(cr, layout)
 
-        # Apply / Cancel affordance as drawn buttons (click handled via keys primarily,
-        # but we also hit-test these zones on click for discoverability).
-        self._btn_apply = (bx + bw - 8 - 90, by - 44, 90, 34)
+        self._btn_done = (bx + bw - 8 - 90, by - 44, 90, 34)
         self._btn_cancel = (bx + bw - 8 - 90 - 10 - 90, by - 44, 90, 34)
         self._draw_button(cr, *self._btn_cancel, "Cancel", False)
-        self._draw_button(cr, *self._btn_apply, "Apply", True)
+        self._draw_button(cr, *self._btn_done, "Done", True)
 
     def _draw_button(self, cr, x, y, w, h, label: str, primary: bool) -> None:
         if primary:
-            cr.set_source_rgba(0.25, 0.55, 0.95, 0.95)
+            cr.set_source_rgba(0.20, 0.50, 0.90, 0.92)
         else:
-            cr.set_source_rgba(0.25, 0.27, 0.32, 0.95)
+            cr.set_source_rgba(0.18, 0.20, 0.24, 0.88)
         self._round_rect(cr, x, y, w, h, 7)
         cr.fill()
         cr.set_source_rgba(1, 1, 1, 0.95)
@@ -524,6 +616,7 @@ class EditorApp(Gtk.Application):
         self._mon = mon
         self._gap = gap
         self._exit_code = 0
+        self._canvas: ArrangeCanvas | None = None
 
     def do_activate(self) -> None:  # noqa: N802 — GObject override
         mx, my, lw, lh, _scale = logical_monitor_box(self._mon)
@@ -536,6 +629,25 @@ class EditorApp(Gtk.Application):
         win = Gtk.ApplicationWindow(application=self)
         win.set_default_size(lw, lh)
         win.set_title("window-arrange editor")
+        # Ask GTK for a transparent background (no white flash on map).
+        try:
+            win.set_css_classes(["wa-editor"])
+            css = Gtk.CssProvider()
+            css.load_from_data(
+                b"""
+                window.wa-editor, window.wa-editor > * {
+                    background-color: transparent;
+                    background-image: none;
+                }
+                """
+            )
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(),
+                css,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
+        except Exception:
+            pass
 
         LayerShell.init_for_window(win)
         LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
@@ -546,7 +658,6 @@ class EditorApp(Gtk.Application):
         LayerShell.set_anchor(win, LayerShell.Edge.RIGHT, True)
         LayerShell.set_exclusive_zone(win, -1)
         LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.EXCLUSIVE)
-        # Pin to the focused monitor when the API exposes output names.
         try:
             name = self._mon.get("name")
             if name:
@@ -554,33 +665,26 @@ class EditorApp(Gtk.Application):
         except Exception:
             pass
 
-        def do_apply(windows: list[dict[str, Any]]) -> None:
-            plan = [
-                {
-                    "address": w["address"],
-                    "class": w.get("class") or "",
-                    "role": w.get("role") or "grid",
-                    "mode": "float",
-                    "x": int(w["x"]),
-                    "y": int(w["y"]),
-                    "w": int(w["w"]),
-                    "h": int(w["h"]),
-                    "fullscreen": w.get("fullscreen") not in (0, False, None),
-                    "floating": bool(w.get("floating", True)),
-                    "pinned": bool(w.get("pinned")),
-                }
-                for w in windows
-            ]
-            result = apply_plan(plan)
+        def do_done(windows: list[dict[str, Any]]) -> None:
+            # Layout is already live-applied during drag; one final commit.
+            if self._canvas is not None:
+                result = self._canvas._apply_now(windows)
+            else:
+                result = apply_plan(_plan_from_windows(windows))
             if result.get("error"):
                 print(f"apply_error={result['error']}", file=sys.stderr)
                 self._exit_code = 1
             else:
-                print(f"applied={result['count']} ms={result['ms']:.0f}")
+                print(f"applied={result.get('count', len(windows))} ms={result.get('ms', 0):.0f}")
                 self._exit_code = 0
             win.close()
 
         def do_cancel() -> None:
+            # Restore geometries from editor open.
+            if self._canvas is not None:
+                result = self._canvas._apply_now(self._canvas.initial_windows)
+                if result.get("error"):
+                    print(f"restore_error={result['error']}", file=sys.stderr)
             print("cancelled")
             self._exit_code = 0
             win.close()
@@ -590,17 +694,17 @@ class EditorApp(Gtk.Application):
             bounds=bounds,
             mon_origin=(mx, my),
             gap=self._gap,
-            on_apply=do_apply,
+            on_done=do_done,
             on_cancel=do_cancel,
         )
+        self._canvas = canvas
 
-        # Overlay Apply/Cancel click targets via a second gesture on canvas.
         click = Gtk.GestureClick.new()
         click.set_button(1)
 
         def on_btn_click(_g, _n, x, y):
             for attr, action in (
-                ("_btn_apply", lambda: canvas.on_apply(canvas.windows)),
+                ("_btn_done", lambda: canvas.on_done(canvas.windows)),
                 ("_btn_cancel", canvas.on_cancel),
             ):
                 btn = getattr(canvas, attr, None)
@@ -625,11 +729,13 @@ class EditorApp(Gtk.Application):
             except ValueError:
                 ms = 0
             if ms:
+
                 def _smoke_quit() -> bool:
                     print("smoke_cancel")
                     win.close()
                     self.quit()
                     return False
+
                 GLib.timeout_add(ms, _smoke_quit)
 
     def _monitor_by_name(self, name: str):
@@ -639,7 +745,6 @@ class EditorApp(Gtk.Application):
         mons = display.get_monitors()
         for i in range(mons.get_n_items()):
             m = mons.get_item(i)
-            # Gdk.Monitor connector / model varies; try a few attrs.
             for attr in ("get_connector", "get_manufacturer"):
                 fn = getattr(m, attr, None)
                 if callable(fn):
@@ -669,7 +774,10 @@ def run_editor(
     if windows is None:
         windows = snapshot_workspace_windows()
     if not windows:
-        print("window-arrange editor: no mapped windows on active workspace", file=sys.stderr)
+        print(
+            "window-arrange editor: no mapped windows on active workspace",
+            file=sys.stderr,
+        )
         return 0
     gap_i = int(gap if gap is not None else _gap_from_env_or_meta(windows))
     app = EditorApp(windows, mon, gap_i)

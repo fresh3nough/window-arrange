@@ -8,6 +8,14 @@ BIN_DIR="${HOME}/.local/bin"
 SHARE_DIR="${HOME}/.local/share/window-arrange"
 mkdir -p "$BIN_DIR" "$SHARE_DIR"
 
+# Soft-check interactive editor deps (arrange itself only needs python3 + hyprctl).
+if ! python3 -c 'import gi; gi.require_version("Gtk4LayerShell","1.0"); gi.require_version("Gtk","4.0"); from gi.repository import Gtk4LayerShell' 2>/dev/null; then
+  echo "note: gtk4-layer-shell GI missing — editor needs: sudo pacman -S gtk4-layer-shell" >&2
+fi
+if ! python3 -c 'import cairo' 2>/dev/null; then
+  echo "note: python-cairo missing — editor needs: sudo pacman -S python-cairo" >&2
+fi
+
 # Python modules must sit next to the launcher (or under share/) for planning + editor.
 for mod in layout.py geometry.py apply.py editor.py; do
   install -m 0644 "${ROOT}/${mod}" "${SHARE_DIR}/${mod}"
@@ -48,13 +56,14 @@ cat >> "$tmp" <<'LUA'
 -- Geometry is planned in Hyprland logical pixels (physical / scale) for HiDPI + scale-1.
 -- Super+J default is dwindle togglesplit — useless once windows are floating,
 -- maximized, or popped (the stacked mess on ultrawide / Surface Book). Rebind it.
+-- Super+B is free on stock Omarchy (browser is Super+Shift+B).
 -- CLI: window-arrange   |   dry-run: window-arrange --dry-run
--- Edit: window-arrange --edit  (drag-swap + edge/corner neighbor resize)
+-- Edit: window-arrange --edit  (live drag-swap + edge/corner neighbor resize)
 -- Boot: window-arrange --on-start (waits for autostart apps, then arranges once)
 hl.unbind("SUPER + J")
 o.bind("SUPER + J", "Arrange windows (grid)", "window-arrange")
 o.bind("SUPER + ALT + A", "Arrange windows", "window-arrange")
-o.bind("SUPER + SHIFT + J", "Arrange windows (edit)", "window-arrange --edit")
+o.bind("SUPER + B", "Arrange windows (edit)", "window-arrange --edit")
 -- window-arrange:end
 LUA
 mv "$tmp" "$BIND_FILE"
@@ -95,7 +104,7 @@ fi
 
 echo "Installed: ${BIN_DIR}/window-arrange"
 echo "Modules:   ${SHARE_DIR}/{layout,geometry,apply,editor}.py"
-echo "Hotkeys:   Super+J / Super+Alt+A arrange · Super+Shift+J edit"
+echo "Hotkeys:   Super+J / Super+Alt+A arrange · Super+B edit"
 echo "Autostart: window-arrange --on-start  (via ~/.config/hypr/autostart.lua)"
 echo "Run:       window-arrange"
 echo "Edit:      window-arrange --edit"
