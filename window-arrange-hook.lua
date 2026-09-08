@@ -4,16 +4,27 @@
 --
 -- window.open fires after window rules are applied. A short oneshot debounce
 -- coalesces burst opens (boot / multi-window launch) into a single arrange.
+-- A second delayed pass catches clients that map late or go fullscreen after
+-- the first pass (e.g. Nautilus as a 7th window).
 
 local M = {}
 
 local gen = 0
-local debounce_ms = tonumber(os.getenv("WINDOW_ARRANGE_OPEN_DEBOUNCE_MS") or "") or 80
+-- Primary debounce: coalesce burst opens.
+local debounce_ms = tonumber(os.getenv("WINDOW_ARRANGE_OPEN_DEBOUNCE_MS") or "") or 120
 if debounce_ms < 0 then
   debounce_ms = 0
 end
 if debounce_ms > 2000 then
   debounce_ms = 2000
+end
+-- Second pass: late map / post-open fullscreen (Nautilus, Electron shells).
+local settle_ms = tonumber(os.getenv("WINDOW_ARRANGE_OPEN_SETTLE_MS") or "") or 450
+if settle_ms < 0 then
+  settle_ms = 0
+end
+if settle_ms > 5000 then
+  settle_ms = 5000
 end
 
 local function should_skip(w)
@@ -68,7 +79,8 @@ end
 
 local function run_arrange()
   -- Quiet toast on auto path; manual Super+J still notifies by default.
-  hl.exec_cmd("env WINDOW_ARRANGE_NOTIFY=0 window-arrange")
+  -- PATH must include ~/.local/bin for hypr exec (set by install / user profile).
+  hl.exec_cmd("env WINDOW_ARRANGE_NOTIFY=0 PATH=\"$HOME/.local/bin:$PATH\" window-arrange")
 end
 
 local function schedule_arrange()
@@ -76,18 +88,42 @@ local function schedule_arrange()
   local my = gen
   if debounce_ms <= 0 then
     run_arrange()
-    return
+  else
+    hl.timer(function()
+      if my ~= gen then
+        return
+      end
+      run_arrange()
+    end, { timeout = debounce_ms, type = "oneshot" })
   end
-  hl.timer(function()
-    if my ~= gen then
-      return
-    end
-    run_arrange()
-  end, { timeout = debounce_ms, type = "oneshot" })
+  -- Second pass after toolkit chrome settles (fullscreen / min-size apply).
+  if settle_ms > 0 then
+    hl.timer(function()
+      if my ~= gen then
+        return
+      end
+      run_arrange()
+    end, { timeout = settle_ms, type = "oneshot" })
+  end
 end
 
 function M.setup()
+  -- Avoid double-registering on config reload.
+  if M._bound then
+    return
+  end
+  M._bound = true
+
   hl.on("window.open", function(w)
+    if should_skip(w) then
+      return
+    end
+    schedule_arrange()
+  end)
+
+  -- Fullscreen toggles (user or app) should re-grid so a new window that
+  -- claims the monitor does not sit behind the existing float grid forever.
+  hl.on("window.fullscreen", function(w)
     if should_skip(w) then
       return
     end
