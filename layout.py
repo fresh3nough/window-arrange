@@ -81,14 +81,27 @@ def wants_wide(c: dict[str, Any]) -> bool:
 
 
 def wants_tall(c: dict[str, Any]) -> bool:
-    """True for apps that often clamp to a large minimum height (~400px)."""
+    """True for apps that often clamp to a large minimum height (~380–400px)."""
     cls = (c.get("class") or "").lower()
     title = (c.get("title") or "").lower()
     needles = (
         "goose", "electron", "slack", "discord", "code", "cursor",
         "1password", "bitwarden",
+        # GTK file manager hard-clamps ~380h on this panel.
+        "nautilus",
     )
     return any(n in cls or n in title for n in needles)
+
+
+def is_hard_tall(c: dict[str, Any]) -> bool:
+    """True when toolkit min height is large enough that a short cell overflows.
+
+    Driven by observed min height only (Nautilus/Goose/1Password ≥350). VS Code
+    ~312 is tall-weighted but not hard — treating it as hard left Nautilus in a
+    crushed leftover cell that clamped over neighbors.
+    """
+    _mw, mh = toolkit_min_size(c)
+    return mh >= 350
 
 
 def toolkit_min_size(c: dict[str, Any]) -> tuple[int, int]:
@@ -100,7 +113,7 @@ def toolkit_min_size(c: dict[str, Any]) -> tuple[int, int]:
     """
     cls = (c.get("class") or "").lower()
     title = (c.get("title") or "").lower()
-    # Browsers: hard min width ~500; height is flexible.
+    # Browsers: hard min width ~500; height is flexible (~100 observed).
     if any(
         n in cls or n in title
         for n in (
@@ -114,22 +127,26 @@ def toolkit_min_size(c: dict[str, Any]) -> tuple[int, int]:
             "librewolf",
         )
     ):
-        return 500, 200
+        return 500, 120
     # 1Password (and Bitwarden): Omarchy float-tag apps; hard width clamp is
     # ~784 logical px on this HiDPI panel — far above the generic Electron floor.
     # Planning a narrower cell center-anchors the clamp and drifts top-left into
     # the neighbor (seen at 617-wide 3-col cells).
     if any(n in cls or n in title for n in ("1password", "bitwarden")):
         return 784, 400
-    # Electron / Goose: both axes clamp.
-    if any(n in cls or n in title for n in ("goose", "electron", "slack", "discord", "code", "cursor")):
+    # Goose / generic Electron: both axes clamp hard.
+    if any(n in cls or n in title for n in ("goose", "electron", "slack", "discord")):
         return 480, 400
-    # GTK file manager: min height ~380, width ~360.
+    # VS Code / Cursor on this panel: live probe ~432×312 (not full Goose floor).
+    if any(n in cls or n in title for n in ("code", "cursor")):
+        return 432, 312
+    # GTK file manager: min height ~380, width ~360 (hard — overflows short cells).
     if "nautilus" in cls or "nautilus" in title:
         return 360, 380
+    # Disks / baobab: width floor ~360; height is flexible (~100 observed).
     if "diskutility" in cls or "gnome-disks" in cls or "baobab" in cls:
-        return 360, 200
-    return 200, 120
+        return 360, 120
+    return 200, 100
 
 
 def min_cell_width_for(grid_w: int, gap: int) -> int:
@@ -827,10 +844,7 @@ def fit_pairs_to_toolkit_mins(
         weights = []
         for i in idxs:
             win = pairs[i][0]
-            _mw, mh = toolkit_min_size(win)
-            # Absolute floor so Goose/1Password keep ~400h when the column can.
-            fl = max(mh if wants_tall(win) else min(mh, 200), 120)
-            floors.append(fl)
+            floors.append(_height_floor_for(win))
             weights.append(_height_weight_for(win))
         bands = split_axis_with_floors(total_h, floors, gap, weights)
         for band_i, cell_i in enumerate(idxs):
@@ -888,6 +902,39 @@ def _oversized_width_clamps(
     return out
 
 
+def _height_floor_for(win: dict[str, Any]) -> int:
+    """Absolute min height we try to plan for this window."""
+    _mw, mh = toolkit_min_size(win)
+    # Always honor the observed toolkit min (Code ~312, Nautilus ~380).
+    return max(int(mh), 80)
+
+
+def _leftover_height_budget_ok(
+    rest: list[dict[str, Any]], grid_h: int, gap: int
+) -> bool:
+    """True when leftover stack can host rest toolkit mins without overflow."""
+    if not rest:
+        return True
+    n = len(rest)
+    usable = grid_h - gap * max(0, n - 1)
+    if usable < n:
+        return False
+    # Hard floors must fit after flexible donors collapse to 80px.
+    hard = sum(_height_floor_for(w) for w in rest if is_hard_tall(w))
+    # Mid-tall (Code ~312): count half-credit so we promote earlier.
+    mid = sum(
+        _height_floor_for(w)
+        for w in rest
+        if (not is_hard_tall(w)) and _height_floor_for(w) >= 280
+    )
+    flex_n = sum(
+        1
+        for w in rest
+        if (not is_hard_tall(w)) and _height_floor_for(w) < 280
+    )
+    return hard + mid + flex_n * 80 <= usable
+
+
 def pack_window_cells(
     windows: list[dict[str, Any]],
     grid_x0: int,
@@ -900,9 +947,9 @@ def pack_window_cells(
 
     When one app (1Password ~784w) exceeds half the grid, reserve a full-height
     strip of that width on the right and pack the rest into the leftover
-    region. Equal half-width stacks cannot honor the clamp without cutting the
-    right edge off-screen; a dedicated strip + leftover pack keeps every frame
-    on-monitor and non-overlapping for 5–7 apps.
+    region. Tall leftover apps (Goose/Nautilus ~380–400h) are promoted into the
+    strip when the leftover stack cannot honor their floors — otherwise live
+    clamps overflow planned cells and overlap neighbors.
     """
     n = len(windows)
     if n <= 0:
@@ -916,46 +963,64 @@ def pack_window_cells(
     if len(oversize) == 1 and n >= 2:
         big = oversize[0]
         mw, mh = toolkit_min_size(big)
-        # Cap strip so leftover stays useful; never exceed the grid.
         strip_w = min(max(mw, 1), grid_w)
         leftover_w = grid_w - strip_w - gap
         min_left = 360 if n >= 3 else 280
         if leftover_w >= min_left and strip_w + gap + leftover_w <= grid_w:
             rest = [w for w in windows if w is not big]
-            # Prefer putting the wide strip on the right (matches phone strip).
             left_x0 = grid_x0
             strip_x0 = grid_x0 + leftover_w + gap
 
-            # When leftover would crush many windows AND the strip can host two
-            # ≥400h rows, seat a second tall app (Goose/code) in the strip.
+            # Strip hosts 1Password + at most one tall mate. Two ~400h rows fit
+            # ~900 logical; three scale-plan then live-clamp off-screen.
+            # Pick the mate that makes the leftover height budget feasible
+            # (Nautilus over Goose when Code also stays in leftover).
             strip_wins: list[dict[str, Any]] = [big]
-            prefer_rh = 400
             two_row_h = (grid_h - gap) // 2
-            if (
-                len(rest) >= 5
-                and two_row_h >= prefer_rh
-                and mh <= two_row_h + 20
-            ):
-                partners = sorted(
-                    [w for w in rest if wants_tall(w)],
-                    key=lambda w: toolkit_min_size(w)[1],
-                    reverse=True,
-                )
-                if partners:
-                    partner = partners[0]
-                    rest = [w for w in rest if w is not partner]
-                    strip_wins.append(partner)
+            max_strip = 2 if two_row_h >= 300 and mh <= two_row_h + 80 else 1
 
-            # Leftover next to a 784 strip is often ~600w — too narrow for two
-            # Chromium-safe columns. Force a single full-width stack so every
-            # rest cell is leftover_w wide (clamps cannot spill into the strip).
+            def _is_strip_candidate(w: dict[str, Any]) -> bool:
+                return is_hard_tall(w) or _height_floor_for(w) >= 280
+
+            def _leftover_pressure(wins: list[dict[str, Any]]) -> tuple:
+                """Sort key: feasible first, then lower tall demand."""
+                ok = _leftover_height_budget_ok(wins, grid_h, gap)
+                tall = sum(
+                    _height_floor_for(w)
+                    for w in wins
+                    if is_hard_tall(w) or _height_floor_for(w) >= 280
+                )
+                flex_n = sum(
+                    1
+                    for w in wins
+                    if (not is_hard_tall(w)) and _height_floor_for(w) < 280
+                )
+                return (0 if ok else 1, tall, flex_n)
+
+            if max_strip >= 2 and (
+                not _leftover_height_budget_ok(rest, grid_h, gap) or len(rest) >= 4
+            ):
+                pool = [w for w in rest if _is_strip_candidate(w)]
+                best = None
+                best_key = None
+                for cand in pool:
+                    trial = [w for w in rest if w is not cand]
+                    key = _leftover_pressure(trial)
+                    # Tie-break: prefer hungrier mate on the strip.
+                    key = key + (-_height_floor_for(cand),)
+                    if best is None or key < best_key:
+                        best, best_key = cand, key
+                if best is not None:
+                    rest = [w for w in rest if w is not best]
+                    strip_wins.append(best)
+
             rest_cells: list[tuple[int, int, int, int]] = []
             if rest:
                 rest_demand = max(
                     (toolkit_min_size(w)[0] for w in rest), default=500
                 )
                 can_two = leftover_w >= rest_demand * 2 + gap
-                if can_two:
+                if can_two and _leftover_height_budget_ok(rest, grid_h, gap):
                     rest_prefer = min_cell_width_for(leftover_w, gap)
                     rest_cells = place_grid(
                         len(rest),
@@ -967,10 +1032,7 @@ def pack_window_cells(
                         min_cell_w=rest_prefer,
                     )
                 else:
-                    # One column, weighted heights for tall rest apps.
-                    weights = [_height_weight_for(w) for w in rest]
-                    # Sort rest so tall apps get weight via assign after equal
-                    # bands; fit_pairs will reweight. Use equal bands first.
+                    # One full-width column — fit_pairs applies floor-aware heights.
                     bands = split_axis(grid_h, len(rest), gap)
                     rest_cells = [
                         (left_x0, grid_y0 + ry, leftover_w, rh)
@@ -989,13 +1051,12 @@ def pack_window_cells(
                     grid_h=grid_h,
                 )
 
-            # Strip cells: full-height solo, or floor-aware 2-row stack.
             if len(strip_wins) == 1:
                 strip_pairs = [
                     (strip_wins[0], (strip_x0, grid_y0, strip_w, grid_h))
                 ]
             else:
-                floors = [toolkit_min_size(w)[1] for w in strip_wins]
+                floors = [_height_floor_for(w) for w in strip_wins]
                 weights = [_height_weight_for(w) for w in strip_wins]
                 bands = split_axis_with_floors(grid_h, floors, gap, weights)
                 strip_pairs = [
