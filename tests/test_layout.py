@@ -236,23 +236,134 @@ class TestPlanBounds(unittest.TestCase):
         self.assertEqual(len(plan), 6)
         self._assert_in_logical(plan, mon, outer=16)
         assert_no_plan_overlap(self, plan)
-        # 1Password min_w is 784; on ~1440 logical that exceeds half-grid, so
-        # packer still uses 2-col stacks (widest possible) and settle pins clamp.
-        for item in plan:
-            self.assertGreaterEqual(item["w"], 500, msg=item)
-        widths = {p["class"]: p["w"] for p in plan}
-        # Two-column stacks: every cell shares the half-width band.
-        self.assertEqual(len(set(widths.values())), 1, msg=widths)
+        # 1Password min_w is 784; columns are weighted so its stack is wide
+        # enough and other cells stay Chromium-safe (≥500 when possible).
         op = next(p for p in plan if p["class"] == "1password")
         self.assertEqual(op.get("min_w"), 784, msg=op)
+        self.assertGreaterEqual(op["w"], 784, msg=op)
+        for item in plan:
+            if item["class"] == "1password":
+                continue
+            self.assertGreaterEqual(item["w"], 480, msg=item)
         # Goose (tall) should receive a weighted-taller cell when possible.
         goose = next(p for p in plan if p["class"] == "goose")
         self.assertGreaterEqual(goose["h"], 350, msg=goose)
+        # Bounds meta is present for settle pins of oversize clamps.
+        self.assertIn("bound_x1", op.get("meta") or {})
 
     def test_1password_toolkit_min_width(self):
         """Live clamp is ~784 logical px; plan floor must match."""
         self.assertEqual(toolkit_min_size(fake_client("0x1", "1password")), (784, 400))
         self.assertEqual(toolkit_min_size(fake_client("0x2", "Bitwarden")), (784, 400))
+
+    def test_hidpi_five_with_1password_column_fits_clamp(self):
+        """Five apps on HiDPI: 1Password column ≥784 so live clamp stays on-screen."""
+        mon = mon_hidpi()
+        clients = [
+            fake_client("0x1", "1password"),
+            fake_client("0x2", "chromium"),
+            fake_client("0x3", "foot"),
+            fake_client("0x4", "goose"),
+            fake_client("0x5", "TUI.float"),
+        ]
+        plan = build_plan(
+            [mon], clients, {"id": 1},
+            gap=12, outer=16, auto_adapt=False,
+        )
+        self.assertEqual(len(plan), 5)
+        self._assert_in_logical(plan, mon, outer=16)
+        assert_no_plan_overlap(self, plan)
+        op = next(p for p in plan if p["class"] == "1password")
+        self.assertGreaterEqual(op["w"], 784, msg=op)
+        self.assertGreaterEqual(op["h"], 400, msg=op)
+        # Planned right edge must stay inside logical monitor.
+        mx, my, lw, lh, _ = logical_monitor_box(mon)
+        self.assertLessEqual(op["x"] + op["w"], mx + lw + 1, msg=op)
+        # Donor column still usable for Chromium.
+        chrome = next(p for p in plan if p["class"] == "chromium")
+        self.assertGreaterEqual(chrome["w"], 500, msg=chrome)
+
+    def test_hidpi_seven_with_1password_no_cutoff(self):
+        """Seven apps on HiDPI: stacks keep 1Password on-screen without overlap."""
+        mon = mon_hidpi()
+        clients = [
+            fake_client("0x1", "1password"),
+            fake_client("0x2", "chromium"),
+            fake_client("0x3", "foot"),
+            fake_client("0x4", "goose"),
+            fake_client("0x5", "TUI.float"),
+            fake_client("0x6", "code"),
+            fake_client("0x7", "org.gnome.DiskUtility"),
+        ]
+        plan = build_plan(
+            [mon], clients, {"id": 1},
+            gap=12, outer=16, auto_adapt=False,
+        )
+        self.assertEqual(len(plan), 7)
+        self._assert_in_logical(plan, mon, outer=16)
+        assert_no_plan_overlap(self, plan)
+        op = next(p for p in plan if p["class"] == "1password")
+        mx, my, lw, lh, _ = logical_monitor_box(mon)
+        # Dedicated oversize strip: planned width honors the 784 clamp.
+        self.assertGreaterEqual(op["w"], 784, msg=op)
+        self.assertLessEqual(op["x"] + op["w"], mx + lw + 1, msg=op)
+        self.assertGreaterEqual(op["h"], 400, msg=op)
+        # Strip is either full-height solo 1Password or shared with a tall mate.
+        strip_mates = [
+            p for p in plan
+            if p["x"] == op["x"] and p["w"] == op["w"] and p["address"] != op["address"]
+        ]
+        self.assertIn(len(strip_mates), (0, 1), msg=plan)
+        if strip_mates:
+            self.assertGreaterEqual(strip_mates[0]["h"], 350, msg=strip_mates[0])
+            strip_addrs = {op["address"], strip_mates[0]["address"]}
+        else:
+            # Solo strip should be full work-area height-ish.
+            self.assertGreaterEqual(op["h"], 700, msg=op)
+            strip_addrs = {op["address"]}
+        # No leftover cell may spill into the strip.
+        strip_x = op["x"]
+        for item in plan:
+            if item["address"] in strip_addrs:
+                continue
+            self.assertLessEqual(item["x"] + item["w"], strip_x + 1, msg=item)
+
+    
+    def test_hidpi_seven_nautilus_code_no_overlap(self):
+        """Live mix: 1P + Goose + Code + Nautilus + Disks + Chromium + foot."""
+        mon = mon_hidpi()
+        clients = [
+            fake_client("0x1", "1password"),
+            fake_client("0x2", "chromium"),
+            fake_client("0x3", "foot"),
+            fake_client("0x4", "goose"),
+            fake_client("0x5", "code"),
+            fake_client("0x6", "org.gnome.DiskUtility"),
+            fake_client("0x7", "org.gnome.Nautilus"),
+        ]
+        plan = build_plan(
+            [mon], clients, {"id": 1},
+            gap=12, outer=16, auto_adapt=False,
+        )
+        self.assertEqual(len(plan), 7)
+        self._assert_in_logical(plan, mon, outer=16)
+        assert_no_plan_overlap(self, plan)
+        op = next(p for p in plan if p["class"] == "1password")
+        self.assertGreaterEqual(op["w"], 784, msg=op)
+        nau = next(p for p in plan if p["class"] == "org.gnome.Nautilus")
+        goose = next(p for p in plan if p["class"] == "goose")
+        # 1P strip shares with one tall mate; the other hard-tall is leftover.
+        self.assertGreaterEqual(op["w"], 784, msg=op)
+        self.assertGreaterEqual(op["h"], 350, msg=op)
+        # At least one of goose/nautilus fully honors tall floor in plan.
+        self.assertTrue(
+            goose["h"] >= 350 or nau["h"] >= 350,
+            msg=(goose, nau),
+        )
+        for item in plan:
+            mw = int(item.get("min_w") or 0)
+            if mw >= 500:
+                self.assertGreaterEqual(item["w"], min(mw, 500), msg=item)
 
     def test_wide_five_with_1password_no_overlap(self):
         """Ultrawide logical 2560x1080: 2+3 five-up must not collapse columns."""

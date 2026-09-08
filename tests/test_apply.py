@@ -9,7 +9,11 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from apply import build_apply_lua  # noqa: E402
+from apply import (  # noqa: E402
+    build_apply_lua,
+    pin_xy_for_live_size,
+    work_bounds_from_plan,
+)
 
 
 def plan_item(
@@ -113,6 +117,35 @@ class TestBuildApplyLua(unittest.TestCase):
         lua = build_apply_lua([plan_item("0xp", "foot")], clients)
         # apply(addr, x, y, w, h, need_fs, need_pin) — last arg true
         self.assertRegex(lua, r"apply\('address:0xp', 10, 20, 800, 500, false, true\)")
+
+
+class TestPinBounds(unittest.TestCase):
+    def test_pin_shifts_left_when_clamp_would_spill(self):
+        """1Password 784w at planned x=726 on 1440 canvas must slide left."""
+        bounds = (16, 42, 1424, 944)
+        x, y = pin_xy_for_live_size(726, 42, 784, 445, bounds)
+        self.assertEqual(y, 42)
+        self.assertEqual(x + 784, 1424)
+        self.assertGreaterEqual(x, 16)
+
+    def test_pin_keeps_planned_when_size_fits(self):
+        bounds = (16, 42, 1424, 944)
+        x, y = pin_xy_for_live_size(726, 42, 698, 445, bounds)
+        self.assertEqual((x, y), (726, 42))
+
+    def test_work_bounds_prefer_meta(self):
+        plan = [
+            {
+                **plan_item("0x1", "1password", x=726, y=42, w=698, h=445),
+                "meta": {
+                    "bound_x0": 16,
+                    "bound_y0": 42,
+                    "bound_x1": 1424,
+                    "bound_y1": 944,
+                },
+            }
+        ]
+        self.assertEqual(work_bounds_from_plan(plan), (16, 42, 1424, 944))
 
 
 if __name__ == "__main__":
