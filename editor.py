@@ -11,11 +11,16 @@ GTK4 + gtk4-layer-shell overlay on the focused monitor:
   - Esc / click Cancel → restore the snapshot taken at editor open
   - R → re-snapshot live window positions
 
+Single-instance: Gtk.Application id + ALLOW_REPLACEMENT/REPLACE so a second
+Super+B never stacks overlays (stacked editors pegged CPU previously).
+The window-arrange launcher also kills any orphan editor.py before start.
+
 Coordinates are Hyprland logical pixels (same space as layout.py).
 """
 
 from __future__ import annotations
 
+import atexit
 import math
 import os
 import sys
@@ -75,8 +80,102 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("PangoCairo", "1.0")
 gi.require_version("Gtk4LayerShell", "1.0")
-from gi.repository import Gdk, GLib, Gtk, Pango, PangoCairo  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
+
+
+def _pid_file_path() -> str:
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    return os.path.join(runtime, "window-arrange", "editor.pid")
+
+
+def _write_pid_file() -> None:
+    path = _pid_file_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+    except OSError:
+        return
+
+    def _clear() -> None:
+        try:
+            if os.path.isfile(path):
+                with open(path, encoding="utf-8") as fh:
+                    if fh.read().strip() == str(os.getpid()):
+                        os.remove(path)
+        except OSError:
+            pass
+
+    atexit.register(_clear)
+
+
+def _claim_single_instance() -> None:
+    """Drop any other editor.py processes before this overlay maps.
+
+    Defense in depth with the bash launcher: if something started editor.py
+    directly (or a previous instance ignored SIGTERM), refuse to stack.
+    """
+    me = os.getpid()
+    here = os.path.abspath(__file__).encode()
+    # Only our module paths — never a random project editor.py.
+    markers = (
+        here,
+        b"/window-arrange/editor.py",
+        b"/share/window-arrange/editor.py",
+        b"/.local/bin/editor.py",
+        b"/.local/share/window-arrange/editor.py",
+    )
+    victims: list[int] = []
+    try:
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            if pid == me:
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    raw = fh.read().replace(b"\0", b" ")
+            except OSError:
+                continue
+            if b"editor.py" not in raw:
+                continue
+            if any(m in raw for m in markers):
+                victims.append(pid)
+    except OSError:
+        victims = []
+
+    if victims:
+        import time
+
+        for pid in victims:
+            try:
+                os.kill(pid, 15)  # SIGTERM
+            except OSError:
+                pass
+
+        deadline = time.time() + 0.6
+        alive: list[int] = list(victims)
+        while time.time() < deadline:
+            still: list[int] = []
+            for pid in alive:
+                try:
+                    os.kill(pid, 0)
+                    still.append(pid)
+                except OSError:
+                    pass
+            alive = still
+            if not alive:
+                break
+            time.sleep(0.05)
+        for pid in alive:
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+
+    _write_pid_file()
 
 
 # Palette — translucent outlines over the real desktop (no white wash).
@@ -642,12 +741,21 @@ class ArrangeCanvas(Gtk.DrawingArea):
 
 class EditorApp(Gtk.Application):
     def __init__(self, windows: list[dict[str, Any]], mon: dict[str, Any], gap: int):
-        super().__init__(application_id="org.omarchy.windowarrange.editor")
+        # ALLOW_REPLACEMENT + REPLACE: a second Super+B takes over the bus name
+        # instead of stacking another CPU-heavy overlay.
+        super().__init__(
+            application_id="org.omarchy.windowarrange.editor",
+            flags=Gio.ApplicationFlags.ALLOW_REPLACEMENT | Gio.ApplicationFlags.REPLACE,
+        )
         self._windows = windows
         self._mon = mon
         self._gap = gap
         self._exit_code = 0
         self._canvas: ArrangeCanvas | None = None
+        try:
+            self.register()
+        except Exception:
+            pass
 
     def do_activate(self) -> None:  # noqa: N802 — GObject override
         mx, my, lw, lh, _scale = logical_monitor_box(self._mon)
@@ -801,6 +909,9 @@ def run_editor(
     gap: int | None = None,
 ) -> int:
     """Launch the overlay. Returns process exit code."""
+    # Kill any stacked/orphan overlays before mapping a new one.
+    _claim_single_instance()
+
     mon = focused_monitor()
     if windows is None:
         windows = snapshot_workspace_windows()

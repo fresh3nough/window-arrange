@@ -79,7 +79,9 @@ window-arrange --on-start   # wait for autostart apps, then arrange once
 
 ### Interactive editor
 
-`window-arrange --edit` opens a **transparent** full-monitor overlay (GTK4 layer-shell) so the real desktop stays visible:
+`window-arrange --edit` opens a **transparent** full-monitor overlay (GTK4 layer-shell) so the real desktop stays visible.
+
+**Single-instance:** only one editor may run. A second Super+B / `--edit` replaces the previous overlay (SIGTERM → SIGKILL) under an exclusive flock. Gtk.Application also uses `ALLOW_REPLACEMENT|REPLACE`. This prevents stacked overlays from pegging CPU (~90% each). Set `WINDOW_ARRANGE_EDITOR_REPLACE=0` to refuse a second launch instead.
 
 - **Drag a window's body** onto another window → **swap** cells in the same row, or **flip whole rows** when dropping across bands (e.g. 2-up top ↔ full-width bottom)
 - **Drag an edge or corner** → grow/shrink that side; **abutting neighbors move with it** and real windows **resize live under the outline** (no white wash, no wait-for-Apply)

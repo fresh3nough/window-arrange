@@ -32,6 +32,7 @@
 #   WINDOW_ARRANGE_ON_START_MIN=2   # min mapped windows before arranging
 #   WINDOW_ARRANGE_ON_START_STABLE=2  # consecutive stable polls required
 #   WINDOW_ARRANGE_OPEN_DEBOUNCE_MS=80  # Lua hook coalesces burst opens
+#   WINDOW_ARRANGE_EDITOR_REPLACE=1    # 0 = refuse second --edit instead of replacing
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -163,11 +164,77 @@ if (( ON_START == 1 )); then
 fi
 
 # Interactive editor: drag to rearrange, edge/corner resize with neighbors.
+# Exactly one overlay may run. A second Super+B / --edit replaces the first
+# so stacked editors can never peg CPU again.
 if (( EDIT == 1 )); then
   if [[ -z ${EDITOR_PY} ]]; then
     echo "window-arrange: editor.py not found (install via install.sh)" >&2
     exit 1
   fi
+
+  RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+  LOCK_DIR="${RUNTIME_DIR}/window-arrange"
+  LOCK_FILE="${LOCK_DIR}/editor.lock"
+  PID_FILE="${LOCK_DIR}/editor.pid"
+  mkdir -p "$LOCK_DIR"
+
+  editor_pids() {
+    # Match window-arrange editor.py only — never this bash wrapper / other apps.
+    local p cmd
+    for p in $(pgrep -f 'editor\.py' 2>/dev/null || true); do
+      [[ -r "/proc/$p/cmdline" ]] || continue
+      cmd=$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null || true)
+      if [[ "$cmd" == *'/window-arrange/editor.py'* \
+         || "$cmd" == *'/share/window-arrange/editor.py'* \
+         || "$cmd" == *'/.local/bin/editor.py'* \
+         || "$cmd" == *'/.local/share/window-arrange/editor.py'* ]]; then
+        printf '%s\n' "$p"
+      fi
+    done
+  }
+
+  kill_editor_pids() {
+    local pids=("$@") i p still
+    ((${#pids[@]})) || return 0
+    kill -TERM "${pids[@]}" 2>/dev/null || true
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      still=()
+      for p in "${pids[@]}"; do
+        kill -0 "$p" 2>/dev/null && still+=("$p")
+      done
+      ((${#still[@]})) || return 0
+      sleep 0.05
+    done
+    kill -KILL "${still[@]}" 2>/dev/null || true
+  }
+
+  # Drop any orphaned editors from previous sessions / crashed locks.
+  mapfile -t _orphans < <(editor_pids)
+  if ((${#_orphans[@]})); then
+    if [[ ${WINDOW_ARRANGE_EDITOR_REPLACE:-1} == 0 ]]; then
+      echo "window-arrange: editor already running (pids: ${_orphans[*]})" >&2
+      exit 0
+    fi
+    echo "window-arrange: replacing prior editor (${_orphans[*]})" >&2
+    kill_editor_pids "${_orphans[@]}"
+  fi
+
+  # Exclusive lock — serializes concurrent Super+B spam.
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    # Another launch holds the lock mid-start; wait briefly then steal.
+    if [[ ${WINDOW_ARRANGE_EDITOR_REPLACE:-1} == 0 ]]; then
+      echo "window-arrange: editor lock busy" >&2
+      exit 0
+    fi
+    flock -w 2 9 || flock -n 9 || true
+    mapfile -t _orphans < <(editor_pids)
+    if ((${#_orphans[@]})); then
+      kill_editor_pids "${_orphans[@]}"
+    fi
+    flock -n 9 || true
+  fi
+
   # Ensure sibling modules import (geometry.py, apply.py, layout.py).
   export PYTHONPATH="${LAYOUT_DIR}:${ROOT}:${PYTHONPATH:-}"
   # gtk4-layer-shell must load before libwayland (see gtk4-layer-shell linking.md).
@@ -182,7 +249,19 @@ if (( EDIT == 1 )); then
       break
     fi
   done
-  exec python3 "$EDITOR_PY"
+
+  # Run editor as a child so the lock FD stays held for the overlay lifetime.
+  # (exec would drop this shell and the flock with it on some paths.)
+  python3 "$EDITOR_PY" &
+  editor_pid=$!
+  echo "$editor_pid" >"$PID_FILE"
+  # shellcheck disable=SC2064
+  trap 'rm -f "$PID_FILE"; kill -TERM "$editor_pid" 2>/dev/null || true' EXIT
+  wait "$editor_pid"
+  ec=$?
+  rm -f "$PID_FILE"
+  trap - EXIT
+  exit "$ec"
 fi
 
 # Snapshot workspace → JSON lines (one object per window).
