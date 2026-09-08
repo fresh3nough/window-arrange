@@ -202,16 +202,18 @@ def apply_plan(
         result["error"] = out[:300]
 
     if settle_retry:
-        # Brief yield so Wayland clients finish configure, then re-move any
-        # window whose top-left drifted (clamped size + center resize) or that
-        # Omarchy re-tagged with floating-window size={875,600}.
+        # Yield so Wayland clients finish configure. A clamping resize in the
+        # same hyprctl eval as move (1Password ~784w) leaves top-left drifted;
+        # a later move-only eval pins it. Omarchy may also re-tag floating-window.
         time.sleep(0.05)
         try:
             live_list = load_json(["hyprctl", "clients", "-j"])
             live = {c["address"]: c for c in live_list if c.get("address")}
         except Exception:
             live = {}
-        fixes: list[str] = []
+
+        place_fixes: list[str] = []
+        move_fixes: list[str] = []
         for p in plan:
             addr = p["address"]
             c = live.get(addr)
@@ -224,22 +226,29 @@ def apply_plan(
             tagged_float = any(
                 str(t).rstrip("*") == "floating-window" for t in tags
             )
-            # If top-left drifted, size mismatched, or Omarchy re-tagged the
-            # window (1Password), pin geometry again. Size may still be the
-            # toolkit min (larger than cell) — move-last keeps the overflow on
-            # the bottom/right edge of the cell instead of spanning neighbors.
-            if (
-                at[0] != px
-                or at[1] != py
-                or size[0] != pw
-                or size[1] != ph
-                or tagged_float
-            ):
-                fixes.append(
+            pos_bad = at[0] != px or at[1] != py
+            size_small = size[0] < pw or size[1] < ph
+            size_mismatch = size[0] != pw or size[1] != ph
+            if not (pos_bad or size_mismatch or tagged_float):
+                continue
+            # If the client clamped larger than the cell, only move — a
+            # same-eval resize back to the cell width re-drifts top-left.
+            if (size[0] > pw or size[1] > ph) and not tagged_float:
+                move_fixes.append(
+                    "pin(%s, %d, %d)" % (lua_str(f"address:{addr}"), px, py)
+                )
+            elif size_small or tagged_float:
+                place_fixes.append(
                     "settle(%s, %d, %d, %d, %d)"
                     % (lua_str(f"address:{addr}"), px, py, pw, ph)
                 )
-        if fixes:
+            elif pos_bad:
+                move_fixes.append(
+                    "pin(%s, %d, %d)" % (lua_str(f"address:{addr}"), px, py)
+                )
+
+        settled = 0
+        if place_fixes:
             settle_lua = (
                 "local function place(w, x, y, rw, rh)\n"
                 "  hl.dispatch(hl.dsp.window.resize({ window = w, x = rw, y = rh }))\n"
@@ -255,15 +264,57 @@ def apply_plan(
                 "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-floating-window' })) end)\n"
                 "  place(w, x, y, rw, rh)\n"
                 "end\n"
-                + "\n".join(fixes)
-                + f'\nprint("settled={len(fixes)}")'
+                + "\n".join(place_fixes)
+                + f'\nprint("settled={len(place_fixes)}")'
             )
             subprocess.run(
                 ["hyprctl", "eval", settle_lua],
                 text=True,
                 capture_output=True,
             )
-            result["settled"] = len(fixes)
+            settled += len(place_fixes)
+            # Clamping resize in settle can drift again — re-read for pin pass.
+            time.sleep(0.05)
+            try:
+                live = {
+                    c["address"]: c
+                    for c in load_json(["hyprctl", "clients", "-j"])
+                    if c.get("address")
+                }
+            except Exception:
+                pass
+            for p in plan:
+                addr = p["address"]
+                c = live.get(addr)
+                if not c:
+                    continue
+                at = c.get("at") or [0, 0]
+                px, py = int(p["x"]), int(p["y"])
+                if at[0] != px or at[1] != py:
+                    pin = "pin(%s, %d, %d)" % (lua_str(f"address:{addr}"), px, py)
+                    if pin not in move_fixes:
+                        move_fixes.append(pin)
+
+        if move_fixes:
+            # Separate eval from any resize: move-only pins clamped clients.
+            pin_lua = (
+                "local function pin(w, x, y)\n"
+                "  pcall(function() hl.dispatch(hl.dsp.window.float({ window = w, action = 'enable' })) end)\n"
+                "  hl.dispatch(hl.dsp.window.move({ window = w, x = x, y = y }))\n"
+                "  hl.dispatch(hl.dsp.window.move({ window = w, x = x, y = y }))\n"
+                "end\n"
+                + "\n".join(move_fixes)
+                + f'\nprint("pinned={len(move_fixes)}")'
+            )
+            subprocess.run(
+                ["hyprctl", "eval", pin_lua],
+                text=True,
+                capture_output=True,
+            )
+            settled += len(move_fixes)
+
+        if settled:
+            result["settled"] = settled
             result["ms"] = (time.monotonic() - t0) * 1000
 
     return result

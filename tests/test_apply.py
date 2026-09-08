@@ -89,15 +89,15 @@ class TestBuildApplyLua(unittest.TestCase):
 
     def test_soften_rule_per_class_including_1password(self):
         plan = [
-            plan_item("0x1", "1password", min_w=480, min_h=400),
+            plan_item("0x1", "1password", min_w=784, min_h=400),
             plan_item("0x2", "chromium", min_w=500, min_h=200),
-            plan_item("0x3", "1password", min_w=480, min_h=400),  # dedupe
+            plan_item("0x3", "1password", min_w=784, min_h=400),  # dedupe
         ]
         lua = build_apply_lua(plan)
         self.assertEqual(lua.count("soften('1password'"), 1)
         self.assertEqual(lua.count("soften('chromium'"), 1)
         # floor is half of toolkit min, clamped to >=80
-        self.assertIn("soften('1password', 240, 200)", lua)
+        self.assertIn("soften('1password', 392, 200)", lua)
         self.assertIn("soften('chromium', 250, 100)", lua)
 
     def test_pop_tag_implies_pin(self):

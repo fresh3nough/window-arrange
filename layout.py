@@ -84,7 +84,10 @@ def wants_tall(c: dict[str, Any]) -> bool:
     """True for apps that often clamp to a large minimum height (~400px)."""
     cls = (c.get("class") or "").lower()
     title = (c.get("title") or "").lower()
-    needles = ("goose", "electron", "slack", "discord", "code", "cursor")
+    needles = (
+        "goose", "electron", "slack", "discord", "code", "cursor",
+        "1password", "bitwarden",
+    )
     return any(n in cls or n in title for n in needles)
 
 
@@ -112,8 +115,14 @@ def toolkit_min_size(c: dict[str, Any]) -> tuple[int, int]:
         )
     ):
         return 500, 200
+    # 1Password (and Bitwarden): Omarchy float-tag apps; hard width clamp is
+    # ~784 logical px on this HiDPI panel — far above the generic Electron floor.
+    # Planning a narrower cell center-anchors the clamp and drifts top-left into
+    # the neighbor (seen at 617-wide 3-col cells).
+    if any(n in cls or n in title for n in ("1password", "bitwarden")):
+        return 784, 400
     # Electron / Goose: both axes clamp.
-    if any(n in cls or n in title for n in ("goose", "electron", "slack", "discord", "code", "cursor", "1password")):
+    if any(n in cls or n in title for n in ("goose", "electron", "slack", "discord", "code", "cursor")):
         return 480, 400
     # GTK file manager: min height ~380, width ~360.
     if "nautilus" in cls or "nautilus" in title:
@@ -259,12 +268,12 @@ def row_counts_for(n: int, cols: int, rows: int) -> list[int]:
     """
     if n <= 0 or rows <= 0:
         return []
-    if n == 5 and rows == 2 and cols <= 2:
-        # Caller still asked for 2 rows with 2-col cap: 2+3 would need 3 cols.
-        # Prefer 2+3 visually but only when cols allows; otherwise 2+2+1 via rows=3.
-        return [2, 3] if cols >= 3 else [2, 3]
     if n == 5 and rows == 2 and cols >= 3:
         return [2, 3]
+    if n == 5 and rows == 2 and cols <= 2:
+        # 2-col cap cannot host 2+3; fall through to even split (stacks handle
+        # the real 5-up path via place_column_stacks).
+        return [2, 3] if cols >= 3 else [3, 2]
     if n == 5 and rows >= 3:
         return [2, 2, 1]
     counts: list[int] = []
@@ -323,6 +332,29 @@ def split_axis_weighted(
     return out
 
 
+def _stack_column_counts(n: int, n_cols: int) -> list[int]:
+    """How many windows per stack column (left → right), summing to n."""
+    if n <= 0 or n_cols <= 0:
+        return []
+    if n_cols == 1:
+        return [n]
+    if n_cols == 2:
+        # 5 → 3+2 (taller right pair). 6 → 3+3. 7 → 4+3 (legacy two-col).
+        if n == 5:
+            return [3, 2]
+        right = n // 2
+        return [n - right, right]
+    # 3+ columns: balance, bias leftover to the left (more flexible apps).
+    base, rem = divmod(n, n_cols)
+    counts = [base + (1 if i < rem else 0) for i in range(n_cols)]
+    # Prefer not leaving a 1-cell middle column when n=7 → 3+2+2.
+    if n == 7 and n_cols == 3:
+        return [3, 2, 2]
+    if n == 8 and n_cols == 3:
+        return [3, 3, 2]
+    return counts
+
+
 def place_column_stacks(
     n: int,
     grid_x0: int,
@@ -331,24 +363,40 @@ def place_column_stacks(
     grid_h: int,
     gap: int,
     height_weights: list[list[int]] | None = None,
+    *,
+    min_col_w: int = 500,
 ) -> list[tuple[int, int, int, int]]:
-    """Two-column stack layout for counts that cannot form a safe uniform grid.
+    """Multi-column stack layout when a uniform grid would crush toolkit mins.
 
-    Example n=5 → left stack of 3 + right stack of 2. Every cell is ~half the
-    work-area wide (browser-safe ≥ Chromium 500). Optional per-column
-    height_weights (left list, right list) grow tall-min apps inside a stack
-    so Goose/Electron keep ≥400px without overlapping neighbors.
-    Cells are returned left-stack first (top→bottom), then right-stack.
+    Example n=5 → 3+2 two-col stacks. n=7 on a wide canvas → 3+2+2 three-col
+    so tall apps (~400h) still fit; two-col 4+3 would leave ~240px rows.
+    Optional per-column height_weights grow tall-min apps inside a stack.
+    Cells are returned column-major (left→right, top→bottom within each).
     """
     if n <= 0:
         return []
-    right_n = n // 2
-    left_n = n - right_n
-    # For 5: left 3 flexible, right 2 taller. For 7: left 4, right 3.
+    # As many columns as width allows at min_col_w, capped so each stack has
+    # enough height for a tall min (~400) when possible.
+    max_by_w = max(1, (grid_w + gap) // (max(min_col_w, 1) + gap))
+    # Rows needed if we use k columns ≈ ceil(n/k); want row height ≥ 400.
+    prefer_rh = 400
+    best_cols = 2 if n >= 2 else 1
+    for k in range(1, min(n, max_by_w) + 1):
+        rows_k = math.ceil(n / k)
+        rh = (grid_h - gap * (rows_k - 1)) / max(rows_k, 1)
+        cw = (grid_w - gap * (k - 1)) / k
+        if cw < min_col_w * 0.9:
+            continue
+        # Prefer the smallest k that keeps rh above prefer_rh; otherwise max k.
+        if rh >= prefer_rh:
+            best_cols = k
+            break
+        best_cols = k
+    # n=5 always two-col 3+2 (classic).
     if n == 5:
-        left_n, right_n = 3, 2
-    col_bands = split_axis(grid_w, 2, gap)
-    counts = (left_n, right_n)
+        best_cols = 2
+    counts = _stack_column_counts(n, best_cols)
+    col_bands = split_axis(grid_w, len(counts), gap)
     cells: list[tuple[int, int, int, int]] = []
     for col_i, ((cx, cw), count) in enumerate(zip(col_bands, counts)):
         if count <= 0:
@@ -400,7 +448,9 @@ def place_grid(
     # 6-up on HiDPI (~461px 3-col cells vs Chromium 500).
     can_stack = grid_w >= prefer_cw * 2 + gap
     if can_stack and densest_cw + 0.5 < prefer_cw:
-        return place_column_stacks(n, grid_x0, grid_y0, grid_w, grid_h, gap)
+        return place_column_stacks(
+            n, grid_x0, grid_y0, grid_w, grid_h, gap, min_col_w=prefer_cw
+        )
     # Secondary: height-crushed multi-row with soft width miss.
     soft_cw = max(160, min(prefer_cw, 460))
     if (
@@ -410,7 +460,20 @@ def place_grid(
         and densest_rh < prefer_rh
         and not (n % 2 == 0 and rows == 2 and densest_cw >= soft_cw)
     ):
-        return place_column_stacks(n, grid_x0, grid_y0, grid_w, grid_h, gap)
+        return place_column_stacks(
+            n, grid_x0, grid_y0, grid_w, grid_h, gap, min_col_w=prefer_cw
+        )
+    # Tertiary: 7+ windows where a uniform grid keeps width but crushes height
+    # below tall toolkit mins — prefer multi-col stacks sized to prefer_cw.
+    if (
+        can_stack
+        and n >= 7
+        and densest_rh + 0.5 < prefer_rh
+        and grid_w >= prefer_cw * 3 + gap * 2
+    ):
+        return place_column_stacks(
+            n, grid_x0, grid_y0, grid_w, grid_h, gap, min_col_w=prefer_cw
+        )
 
     counts = row_counts_for(n, cols, rows)
     row_bands = split_axis(grid_h, len(counts), gap)
@@ -479,15 +542,21 @@ def assign_windows_to_cells(
 def _group_cells_by_column(
     cells: list[tuple[int, int, int, int]],
 ) -> list[list[int]]:
-    """Indices of cells sharing the same x, top→bottom within each column."""
+    """Indices of cells stacked in the same column band (same x and width).
+
+    Keyed by (x, w) — not x alone. A 2+3 five-up grid puts a wide top-left
+    cell and a narrower bottom-left cell on the same x; grouping those
+    together and forcing one width was collapsing the 3-col bottom row into
+    the top-row half-width and overlapping neighbors.
+    """
     if not cells:
         return []
-    by_x: dict[int, list[int]] = {}
-    for i, (x, _y, _w, _h) in enumerate(cells):
-        by_x.setdefault(x, []).append(i)
-    cols = []
-    for x in sorted(by_x):
-        idxs = by_x[x]
+    by_band: dict[tuple[int, int], list[int]] = {}
+    for i, (x, _y, w, _h) in enumerate(cells):
+        by_band.setdefault((x, w), []).append(i)
+    cols: list[list[int]] = []
+    for key in sorted(by_band):
+        idxs = by_band[key]
         idxs.sort(key=lambda i: cells[i][1])
         cols.append(idxs)
     return cols
@@ -497,12 +566,12 @@ def fit_pairs_to_toolkit_mins(
     pairs: list[tuple[dict[str, Any], tuple[int, int, int, int]]],
     gap: int,
 ) -> list[tuple[dict[str, Any], tuple[int, int, int, int]]]:
-    """Re-flow heights inside each column so toolkit min-heights fit.
+    """Re-flow heights inside each column band so toolkit min-heights fit.
 
-    Width is already half-grid (≥ Chromium 500) in stack mode. When a column
-    has three equal ~292px rows, Goose's 400px clamp overflows; this boosts
-    tall cells and shrinks flexible ones (terminals) so the column still
-    packs exactly with gutters and no overlap.
+    Only cells that share the same x and width are reflowed together (true
+    stacks). When a band has three equal ~292px rows, Goose/1Password's 400px
+    clamp overflows; this boosts tall cells and shrinks flexible ones
+    (terminals) so the band still packs exactly with gutters and no overlap.
     """
     if not pairs:
         return []
@@ -513,12 +582,7 @@ def fit_pairs_to_toolkit_mins(
 
     for idxs in col_groups:
         if len(idxs) <= 1:
-            # Still bump single cell to min if needed (clips only if grid too small).
-            i = idxs[0]
-            wwin, (x, y, w, h) = pairs[i]
-            _mw, mh = toolkit_min_size(wwin)
-            if h < mh:
-                new_cells[i] = (x, y, w, h)  # can't grow without a donor
+            # Single cell: keep planned geometry (clamp handled at apply time).
             continue
 
         # Column vertical span from current cells.
@@ -533,7 +597,7 @@ def fit_pairs_to_toolkit_mins(
             wwin = pairs[i][0]
             _mw, mh = toolkit_min_size(wwin)
             # Weight by min height; flexible apps keep a modest floor so they
-            # still remain usable after donors give space to Goose/Chromium.
+            # still remain usable after donors give space to Goose/1Password.
             base = max(mh, 160)
             if wants_tall(wwin):
                 base = max(base, 400)
@@ -541,13 +605,6 @@ def fit_pairs_to_toolkit_mins(
                 base = max(base, 220)
             weights.append(base)
 
-        # If mins cannot fit even when flexible apps go to absolute floor,
-        # clamp weights so split still covers the column (overlap-free always).
-        min_floor = 80
-        floors = []
-        for i in idxs:
-            _mw, mh = toolkit_min_size(pairs[i][0])
-            floors.append(max(min_floor, min(mh, total_h // len(idxs))))
         # Prefer honoring weights; split_axis_weighted always fills total_h.
         bands = split_axis_weighted(total_h, weights, gap)
         for band_i, cell_i in enumerate(idxs):

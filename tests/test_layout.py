@@ -236,12 +236,67 @@ class TestPlanBounds(unittest.TestCase):
         self.assertEqual(len(plan), 6)
         self._assert_in_logical(plan, mon, outer=16)
         assert_no_plan_overlap(self, plan)
-        # Stacks give ≥500 width so Chromium cannot spill into neighbors.
+        # 1Password min_w is 784; on ~1440 logical that exceeds half-grid, so
+        # packer still uses 2-col stacks (widest possible) and settle pins clamp.
         for item in plan:
             self.assertGreaterEqual(item["w"], 500, msg=item)
+        widths = {p["class"]: p["w"] for p in plan}
+        # Two-column stacks: every cell shares the half-width band.
+        self.assertEqual(len(set(widths.values())), 1, msg=widths)
+        op = next(p for p in plan if p["class"] == "1password")
+        self.assertEqual(op.get("min_w"), 784, msg=op)
         # Goose (tall) should receive a weighted-taller cell when possible.
         goose = next(p for p in plan if p["class"] == "goose")
         self.assertGreaterEqual(goose["h"], 350, msg=goose)
+
+    def test_1password_toolkit_min_width(self):
+        """Live clamp is ~784 logical px; plan floor must match."""
+        self.assertEqual(toolkit_min_size(fake_client("0x1", "1password")), (784, 400))
+        self.assertEqual(toolkit_min_size(fake_client("0x2", "Bitwarden")), (784, 400))
+
+    def test_wide_five_with_1password_no_overlap(self):
+        """Ultrawide logical 2560x1080: 2+3 five-up must not collapse columns."""
+        mon = {
+            "name": "Virtual-1", "width": 5120, "height": 2160, "scale": 2.0,
+            "x": 0, "y": 0, "reserved": [0, 26, 0, 0], "focused": True,
+        }
+        clients = [
+            fake_client("0x1", "1password"),
+            fake_client("0x2", "chromium"),
+            fake_client("0x3", "code"),
+            fake_client("0x4", "foot"),
+            fake_client("0x5", "goose"),
+        ]
+        plan = build_plan([mon], clients, {"id": 1}, gap=12, outer=16, auto_adapt=False)
+        self.assertEqual(len(plan), 5)
+        assert_no_plan_overlap(self, plan)
+        op = next(p for p in plan if p["class"] == "1password")
+        self.assertGreaterEqual(op["w"], 784, msg=op)
+        self.assertGreaterEqual(op["h"], 400, msg=op)
+
+    def test_wide_seven_stacks_tall_mins(self):
+        """Seven apps on ultrawide: 3-col stacks keep tall mins without overlap."""
+        mon = {
+            "name": "Virtual-1", "width": 5120, "height": 2160, "scale": 2.0,
+            "x": 0, "y": 0, "reserved": [0, 26, 0, 0], "focused": True,
+        }
+        clients = [
+            fake_client("0x1", "1password"),
+            fake_client("0x2", "chromium"),
+            fake_client("0x3", "code"),
+            fake_client("0x4", "foot"),
+            fake_client("0x5", "goose"),
+            fake_client("0x6", "foot"),
+            fake_client("0x7", "TUI.float"),
+        ]
+        plan = build_plan([mon], clients, {"id": 1}, gap=12, outer=16, auto_adapt=False)
+        self.assertEqual(len(plan), 7)
+        assert_no_plan_overlap(self, plan)
+        op = next(p for p in plan if p["class"] == "1password")
+        self.assertGreaterEqual(op["w"], 784, msg=op)
+        self.assertGreaterEqual(op["h"], 400, msg=op)
+        goose = next(p for p in plan if p["class"] == "goose")
+        self.assertGreaterEqual(goose["h"], 400, msg=goose)
 
     def test_hidpi_files_chrome_goose_foot_disks(self):
         """Exact user mix: Nautilus + 2×Chromium + Goose + foot + Disks."""
