@@ -359,14 +359,21 @@ class ArrangeCanvas(Gtk.DrawingArea):
             return
         self._applying = True
         try:
-            result = apply_plan(_plan_from_windows(self.windows), refresh_clients=False)
+            # Live drag path: cells are exact, so skip the settle/reflow retry
+            # pass — it sleeps + re-reads clients and made drags laggy/unusable.
+            result = apply_plan(
+                _plan_from_windows(self.windows), refresh_clients=False, settle_retry=False
+            )
             if not result.get("error"):
                 self._last_applied_sig = sig
         finally:
             self._applying = False
 
     def _apply_now(self, windows: list[dict[str, Any]]) -> dict[str, Any]:
-        result = apply_plan(_plan_from_windows(windows), refresh_clients=True)
+        # Exact cells from the editor; no settle/reflow retry (keeps drags live).
+        result = apply_plan(
+            _plan_from_windows(windows), refresh_clients=True, settle_retry=False
+        )
         if not result.get("error"):
             self._last_applied_sig = _geom_signature(windows)
         return result
@@ -821,7 +828,9 @@ class EditorApp(Gtk.Application):
             if self._canvas is not None:
                 result = self._canvas._apply_now(windows)
             else:
-                result = apply_plan(_plan_from_windows(windows))
+                result = apply_plan(
+                    _plan_from_windows(windows), settle_retry=False
+                )
             if result.get("error"):
                 print(f"apply_error={result['error']}", file=sys.stderr)
                 self._exit_code = 1
