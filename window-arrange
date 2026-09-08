@@ -10,6 +10,7 @@
 #   - Exit fullscreen / maximized so the top bar + wallpaper stay visible
 #   - Integer-split grid with gutters; scrcpy/Pixel → right portrait strip
 #   - Strip Omarchy `floating-window*` size/center tags that would fight us
+#   - float { action = "enable" } (bare float toggles and tiles 1Password)
 #
 # Usage:
 #   window-arrange              # apply now
@@ -298,7 +299,7 @@ for line in sys.stdin:
   exit 0
 fi
 
-# apply.py: soften min_size rules, strip Omarchy float tags, resize+move with
+# apply.py: soften min_size, strip Omarchy float tags, enable-float (not toggle),
 # a settle pass so Chromium/Goose toolkit clamps cannot leave overlaps.
 RESULT=$(
   PLAN=$PLAN \

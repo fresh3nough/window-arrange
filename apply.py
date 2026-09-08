@@ -6,12 +6,21 @@ strip Omarchy tags, exit fullscreen, and lock cells the same way.
 
 Toolkit min-size clamps (Chromium ~500w, Goose ~480x400) silently refuse a
 smaller resize; Hyprland's resize is center-anchored, so the top-left drifts
-into the neighbor. We:
+into the neighbor. Omarchy also tags 1Password / Bitwarden / dialogs with
+`floating-window`, which forces `float + center + size {875, 600}` via
+`/usr/share/omarchy/default/hypr/apps/system.lua`. Bare
+`hl.dsp.window.float({})` **toggles** float, so a second arrange (or a stale
+floating bit) tiles the window and the next resize balloons to the monitor.
+
+We:
 
 1. Drop a low min_size window rule for each class before geometry.
-2. resize → move → resize → move (rules can reflow after float).
-3. Final settle pass: move every window to its planned top-left again after
-   the client has applied its configure, so clamps cannot leave overlaps.
+2. Strip Omarchy float/pop tags, then `float { action = "enable" }` (never
+   toggle), then strip tags again (class rules may re-tag 1Password).
+3. resize → move → resize → move (rules can reflow after float).
+4. Final settle pass: enable-float + strip + resize/move again after the
+   client has applied its configure, so clamps / tag size rules cannot leave
+   overlaps.
 """
 
 from __future__ import annotations
@@ -53,7 +62,10 @@ def build_apply_lua(
         "    hl.window_rule({ match = { class = class }, min_size = { mw, mh } })",
         "  end)",
         "end",
-        "local function apply(w, x, y, rw, rh, need_fs, need_float, need_pin)",
+        # Prepare a window for geometry: tags off, floated (enable, not toggle).
+        # 1Password's class rule re-applies +floating-window when other class
+        # rules fire, so strip both before and after ensure_float.
+        "local function prepare(w, need_fs, need_pin)",
         "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-floating-window*' })) end)",
         "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-floating-window' })) end)",
         "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-pop' })) end)",
@@ -65,9 +77,11 @@ def build_apply_lua(
         "  if need_pin then",
         "    pcall(function() hl.dispatch(hl.dsp.window.pin({ window = w })) end)",
         "  end",
-        "  if need_float then",
-        "    hl.dispatch(hl.dsp.window.float({ window = w }))",
-        "  end",
+        "  pcall(function() hl.dispatch(hl.dsp.window.float({ window = w, action = 'enable' })) end)",
+        "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-floating-window*' })) end)",
+        "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-floating-window' })) end)",
+        "end",
+        "local function place(w, x, y, rw, rh)",
         "  -- resize is center-anchored: always finish with move so a clamped",
         "  -- size cannot leave the top-left inside a neighbor cell.",
         "  hl.dispatch(hl.dsp.window.resize({ window = w, x = rw, y = rh }))",
@@ -75,9 +89,19 @@ def build_apply_lua(
         "  hl.dispatch(hl.dsp.window.resize({ window = w, x = rw, y = rh }))",
         "  hl.dispatch(hl.dsp.window.move({ window = w, x = x, y = y }))",
         "end",
+        "local function apply(w, x, y, rw, rh, need_fs, need_pin)",
+        "  prepare(w, need_fs, need_pin)",
+        "  place(w, x, y, rw, rh)",
+        "end",
         "local function settle(w, x, y, rw, rh)",
-        "  hl.dispatch(hl.dsp.window.resize({ window = w, x = rw, y = rh }))",
-        "  hl.dispatch(hl.dsp.window.move({ window = w, x = x, y = y }))",
+        # Re-strip + enable-float: Omarchy class rules can re-tag 1Password
+        # after the first configure, which would snap size back to 875x600.
+        "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-floating-window*' })) end)",
+        "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-floating-window' })) end)",
+        "  pcall(function() hl.dispatch(hl.dsp.window.float({ window = w, action = 'enable' })) end)",
+        "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-floating-window*' })) end)",
+        "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-floating-window' })) end)",
+        "  place(w, x, y, rw, rh)",
         "end",
     ]
 
@@ -99,14 +123,14 @@ def build_apply_lua(
         addr = p["address"]
         live = clients.get(addr, {})
         fs_i = fs_mode(live.get("fullscreen", p.get("fullscreen") or 0))
-        floating = bool(live.get("floating", p.get("floating", True)))
         pinned = bool(live.get("pinned", p.get("pinned")))
         tags = live.get("tags") or []
         if any(str(t).rstrip("*") == "pop" for t in tags):
             pinned = True
-        need_float = not floating
+        # Always prepare (enable-float + strip). Conditional bare float used to
+        # toggle and tile 1Password when the floating bit was already true.
         lines.append(
-            "apply(%s, %d, %d, %d, %d, %s, %s, %s)"
+            "apply(%s, %d, %d, %d, %d, %s, %s)"
             % (
                 lua_str(f"address:{addr}"),
                 int(p["x"]),
@@ -114,7 +138,6 @@ def build_apply_lua(
                 int(p["w"]),
                 int(p["h"]),
                 "true" if fs_i else "false",
-                "true" if need_float else "false",
                 "true" if pinned else "false",
             )
         )
@@ -180,7 +203,8 @@ def apply_plan(
 
     if settle_retry:
         # Brief yield so Wayland clients finish configure, then re-move any
-        # window whose top-left drifted (clamped size + center resize).
+        # window whose top-left drifted (clamped size + center resize) or that
+        # Omarchy re-tagged with floating-window size={875,600}.
         time.sleep(0.05)
         try:
             live_list = load_json(["hyprctl", "clients", "-j"])
@@ -196,20 +220,40 @@ def apply_plan(
             at = c.get("at") or [0, 0]
             size = c.get("size") or [0, 0]
             px, py, pw, ph = int(p["x"]), int(p["y"]), int(p["w"]), int(p["h"])
-            # If top-left drifted or size overshot into neighbor territory,
-            # pin top-left again at the planned origin. Size may still be the
+            tags = c.get("tags") or []
+            tagged_float = any(
+                str(t).rstrip("*") == "floating-window" for t in tags
+            )
+            # If top-left drifted, size mismatched, or Omarchy re-tagged the
+            # window (1Password), pin geometry again. Size may still be the
             # toolkit min (larger than cell) — move-last keeps the overflow on
             # the bottom/right edge of the cell instead of spanning neighbors.
-            if at[0] != px or at[1] != py or size[0] != pw or size[1] != ph:
+            if (
+                at[0] != px
+                or at[1] != py
+                or size[0] != pw
+                or size[1] != ph
+                or tagged_float
+            ):
                 fixes.append(
                     "settle(%s, %d, %d, %d, %d)"
                     % (lua_str(f"address:{addr}"), px, py, pw, ph)
                 )
         if fixes:
             settle_lua = (
-                "local function settle(w, x, y, rw, rh)\n"
+                "local function place(w, x, y, rw, rh)\n"
                 "  hl.dispatch(hl.dsp.window.resize({ window = w, x = rw, y = rh }))\n"
                 "  hl.dispatch(hl.dsp.window.move({ window = w, x = x, y = y }))\n"
+                "  hl.dispatch(hl.dsp.window.resize({ window = w, x = rw, y = rh }))\n"
+                "  hl.dispatch(hl.dsp.window.move({ window = w, x = x, y = y }))\n"
+                "end\n"
+                "local function settle(w, x, y, rw, rh)\n"
+                "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-floating-window*' })) end)\n"
+                "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-floating-window' })) end)\n"
+                "  pcall(function() hl.dispatch(hl.dsp.window.float({ window = w, action = 'enable' })) end)\n"
+                "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-floating-window*' })) end)\n"
+                "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-floating-window' })) end)\n"
+                "  place(w, x, y, rw, rh)\n"
                 "end\n"
                 + "\n".join(fixes)
                 + f'\nprint("settled={len(fixes)}")'

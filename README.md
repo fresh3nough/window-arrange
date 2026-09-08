@@ -56,7 +56,7 @@ nothing. Current path:
 1. One `layout.py` plan (logical px) — 2-col stacks when cells would be < toolkit min  
 2. One `hyprctl clients -j` snapshot (fullscreen / pinned / tags)  
 3. One `hyprctl eval` via `apply.py` (soften `min_size`, strip Omarchy float tags,
-   exit fs, float if needed, resize+move, settle pass)  
+   exit fs, `float { action = "enable" }`, resize+move, settle pass)  
 
 Typical wall time on 5–6 windows: **~5–20ms** eval (+~50ms settle). No focus cycling.
 
