@@ -665,6 +665,10 @@ def snapshot_workspace_windows() -> list[dict[str, Any]]:
     clients = load_json(["hyprctl", "clients", "-j"])
     ws_id = active.get("id")
     wins: list[dict[str, Any]] = []
+    try:
+        from layout import toolkit_min_size
+    except Exception:
+        toolkit_min_size = None
     for c in clients:
         if not c.get("mapped") or c.get("hidden"):
             continue
@@ -678,6 +682,12 @@ def snapshot_workspace_windows() -> list[dict[str, Any]]:
             continue
         at = c.get("at") or [0, 0]
         size = c.get("size") or [100, 100]
+        _mw = _mh = None
+        if toolkit_min_size is not None:
+            try:
+                _mw, _mh = toolkit_min_size(c)
+            except Exception:
+                pass
         wins.append(
             {
                 "address": addr,
@@ -690,6 +700,11 @@ def snapshot_workspace_windows() -> list[dict[str, Any]]:
                 "floating": bool(c.get("floating")),
                 "fullscreen": c.get("fullscreen") not in (0, False, None),
                 "pinned": bool(c.get("pinned")),
+                # Per-window toolkit minimums let the editor refuse resizes that
+                # would shrink a toolkit-clamped app (Chromium ~500w) below its
+                # floor and overlap its live-clamped neighbor.
+                "min_w": int(_mw) if _mw else 0,
+                "min_h": int(_mh) if _mh else 0,
                 "role": "phone"
                 if (
                     (c.get("class") or "").lower() == "scrcpy"

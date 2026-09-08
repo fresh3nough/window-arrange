@@ -16,6 +16,8 @@ from geometry import (  # noqa: E402
     find_neighbors,
     hit_test_handle,
     layout_is_valid,
+    rects_overlap,
+    resize_edge,
     rearrange_drop,
     resize_edge,
     resize_handle,
@@ -494,3 +496,41 @@ class TestHitTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPerWindowMinResize(unittest.TestCase):
+    """Editor resizes must not shrink a toolkit-clamped app below its own min."""
+
+    def _chromium_code_row(self):
+        # chromium (min 500w) beside code (min 432w), both 200h tall each.
+        return [
+            {"address": "a", "class": "chromium", "x": 16, "y": 42,
+             "w": 612, "h": 200, "min_w": 500, "min_h": 120,
+             "floating": True, "fullscreen": False, "pinned": False},
+            {"address": "b", "class": "code", "x": 640, "y": 42,
+             "w": 612, "h": 200, "min_w": 432, "min_h": 312,
+             "floating": True, "fullscreen": False, "pinned": False},
+        ]
+
+    def test_shrink_left_neighbor_below_own_min_is_refused(self):
+        wins = self._chromium_code_row()
+        bounds = (16, 42, 1424, 944)
+        # Drag chromium's right edge left by 200: would shrink chromium to 412
+        # (< 500 min) and grow code to 812. Must be refused.
+        out = resize_edge(wins, 0, "right", -200, gap=12, min_w=200, min_h=120, bounds=bounds)
+        # The motion is refused: geometry unchanged (or chromium stays >= 500).
+        self.assertGreaterEqual(out[0]["w"], 500, msg=out)
+
+    def test_grow_chromium_does_not_shrink_code_below_own_min(self):
+        wins = self._chromium_code_row()
+        bounds = (16, 42, 1424, 944)
+        # Grow chromium right by a huge amount: code shrinks but never < 432.
+        out = resize_edge(wins, 0, "right", 5000, gap=12, min_w=200, min_h=120, bounds=bounds)
+        self.assertGreaterEqual(out[0]["w"], 500, msg=out)
+        self.assertGreaterEqual(out[1]["w"], 432, msg=out)
+        # No overlap between them.
+        from geometry import rects_overlap
+        self.assertFalse(rects_overlap(
+            (out[0]["x"], out[0]["y"], out[0]["w"], out[0]["h"]),
+            (out[1]["x"], out[1]["y"], out[1]["w"], out[1]["h"]),
+        ))

@@ -68,6 +68,20 @@ def any_overlaps(
     return bad
 
 
+def _window_mins(
+    w: dict[str, Any], min_w: int = DEFAULT_MIN_W, min_h: int = DEFAULT_MIN_H
+) -> tuple[int, int]:
+    """Per-window toolkit minimums, falling back to the caller's global floor.
+
+    Toolkit-clamped apps (Chromium ~500w, Goose ~480x400, Nautilus ~360x380)
+    refuse to render smaller, so resizing a neighbor below its own min width
+    made the live clamp overlap it. Use each window's own min when present.
+    """
+    mw = int(w.get("min_w") or min_w)
+    mh = int(w.get("min_h") or min_h)
+    return mw, mh
+
+
 def layout_is_valid(
     windows: list[dict[str, Any]],
     bounds: tuple[int, int, int, int] | None = None,
@@ -75,9 +89,10 @@ def layout_is_valid(
     min_w: int = DEFAULT_MIN_W,
     min_h: int = DEFAULT_MIN_H,
 ) -> bool:
-    """No interior overlaps, every tile >= min size, optionally inside bounds."""
+    """No interior overlaps, every tile >= its own min size, inside bounds."""
     for w in windows:
-        if int(w["w"]) < min_w or int(w["h"]) < min_h:
+        mw, mh = _window_mins(w, min_w, min_h)
+        if int(w["w"]) < mw or int(w["h"]) < mh:
             return False
         if bounds is not None:
             x0, y0, x1, y1 = bounds
@@ -137,8 +152,9 @@ def _clamp_delta_grow(
     neighbor_sizes: list[int],
     delta: int,
     min_size: int,
+    neighbor_mins: list[int] | None = None,
 ) -> int:
-    """Clamp delta so primary and every neighbor stay >= min_size.
+    """Clamp delta so primary stays >= min_size and each neighbor >= its own min.
 
     Positive delta grows primary and shrinks neighbors (right/bottom edges).
     Negative delta shrinks primary and grows neighbors.
@@ -148,9 +164,12 @@ def _clamp_delta_grow(
     # Primary lower bound
     if delta < 0:
         delta = max(delta, min_size - primary_size)
-    # Neighbors shrink when delta > 0
+    # Neighbors shrink when delta > 0 — cap by each neighbor's own min.
     if delta > 0 and neighbor_sizes:
-        max_shrink = min(s - min_size for s in neighbor_sizes)
+        mins = neighbor_mins or [min_size] * len(neighbor_sizes)
+        max_shrink = min(
+            s - m for s, m in zip(neighbor_sizes, mins)
+        )
         delta = min(delta, max(0, max_shrink))
     return delta
 
@@ -160,6 +179,7 @@ def _clamp_delta_shrink_primary_grows_on_neg(
     neighbor_sizes: list[int],
     delta: int,
     min_size: int,
+    neighbor_mins: list[int] | None = None,
 ) -> int:
     """For left/top edges: positive delta moves the edge right/down.
 
@@ -171,9 +191,12 @@ def _clamp_delta_shrink_primary_grows_on_neg(
     # Shrinking primary (delta > 0)
     if delta > 0:
         delta = min(delta, max(0, primary_size - min_size))
-    # Shrinking neighbors (delta < 0)
+    # Shrinking neighbors (delta < 0) — cap by each neighbor's own min.
     if delta < 0 and neighbor_sizes:
-        max_shrink = min(s - min_size for s in neighbor_sizes)
+        mins = neighbor_mins or [min_size] * len(neighbor_sizes)
+        max_shrink = min(
+            s - m for s, m in zip(neighbor_sizes, mins)
+        )
         delta = max(delta, -max(0, max_shrink))
     return delta
 
@@ -347,19 +370,26 @@ def resize_edge(
     src = out[index]
     neighbors = find_neighbors(out, index, edge, gap=gap)
     ignore = {index, *neighbors}
+    # Resolve per-window minimums so neighbors can't be shrunk below their own
+    # toolkit min (Chromium ~500w) — that previously left live overlaps.
+    src_mw, src_mh = _window_mins(src, min_w, min_h)
+    n_mins = [_window_mins(out[j], min_w, min_h) for j in neighbors]
 
     if edge in ("left", "right"):
-        min_size = min_w
+        min_size = src_mw
         sizes = [out[j]["w"] for j in neighbors]
+        neighbor_mins = [m[0] for m in n_mins]
         if edge == "right":
-            delta = _clamp_delta_grow(src["w"], sizes, delta, min_size)
+            delta = _clamp_delta_grow(src["w"], sizes, delta, min_size, neighbor_mins)
             if delta > 0:
                 # Growing primary right: blocked by free-space obstacles.
                 free = _max_free_growth(out, index, "right", gap, bounds, ignore)
                 delta = min(delta, free)
             # delta < 0 shrinks primary; neighbors grow left (inward) — safe.
         else:
-            delta = _clamp_delta_shrink_primary_grows_on_neg(src["w"], sizes, delta, min_size)
+            delta = _clamp_delta_shrink_primary_grows_on_neg(
+                src["w"], sizes, delta, min_size, neighbor_mins
+            )
             if delta < 0:
                 # Growing primary left.
                 free = _max_free_growth(out, index, "left", gap, bounds, ignore)
@@ -371,15 +401,18 @@ def resize_edge(
                 )
                 delta = min(delta, free)
     else:
-        min_size = min_h
+        min_size = src_mh
         sizes = [out[j]["h"] for j in neighbors]
+        neighbor_mins = [m[1] for m in n_mins]
         if edge == "bottom":
-            delta = _clamp_delta_grow(src["h"], sizes, delta, min_size)
+            delta = _clamp_delta_grow(src["h"], sizes, delta, min_size, neighbor_mins)
             if delta > 0:
                 free = _max_free_growth(out, index, "bottom", gap, bounds, ignore)
                 delta = min(delta, free)
         else:
-            delta = _clamp_delta_shrink_primary_grows_on_neg(src["h"], sizes, delta, min_size)
+            delta = _clamp_delta_shrink_primary_grows_on_neg(
+                src["h"], sizes, delta, min_size, neighbor_mins
+            )
             if delta < 0:
                 free = _max_free_growth(out, index, "top", gap, bounds, ignore)
                 delta = max(delta, -free)

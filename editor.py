@@ -235,6 +235,8 @@ def _plan_from_windows(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "fullscreen": w.get("fullscreen") not in (0, False, None),
             "floating": bool(w.get("floating", True)),
             "pinned": bool(w.get("pinned")),
+            "min_w": int(w.get("min_w") or 0),
+            "min_h": int(w.get("min_h") or 0),
         }
         for w in windows
     ]
