@@ -33,10 +33,11 @@ DEFAULT_MIN_H = 120
 DEFAULT_GAP = 12
 # How close two edges must be (beyond the nominal gap) to count as abutting.
 EDGE_SLOP = 6
-# Pixel hit target for edge/corner grabs in the overlay.
-HANDLE_PX = 10
-CORNER_PX = 14
-
+# Pixel hit target for edge/corner grabs in the overlay (logical px).
+# Generous on purpose: at scale 2.0 a 10px zone is a 5px physical target and
+# users always miss it, ending up on body-drag reorder instead of resize.
+HANDLE_PX = 28
+CORNER_PX = 36
 
 def _as_rect(w: dict[str, Any]) -> tuple[int, int, int, int]:
     return int(w["x"]), int(w["y"]), int(w["w"]), int(w["h"])
@@ -680,6 +681,84 @@ def rearrange_drop(
     )
 
 
+def _clamp_handle_px(
+    ww: int,
+    hh: int,
+    handle_px: int,
+    corner_px: int,
+) -> tuple[int, int]:
+    """Keep a usable body grab on tiny tiles by capping zone size."""
+    # Leave at least ~40% of each axis as pure body when the tile is small.
+    max_h = max(6, min(handle_px, ww // 3, hh // 3))
+    max_c = max(max_h, min(corner_px, ww // 2, hh // 2))
+    return max_h, max_c
+
+
+def _classify_handle_for_rect(
+    px: int,
+    py: int,
+    x: int,
+    y: int,
+    ww: int,
+    hh: int,
+    handle_px: int,
+    corner_px: int,
+) -> tuple[Handle, float] | None:
+    """Return (handle, distance) if point is on/near this rect, else None.
+
+    Distance is 0 for interior hits and the outside offset for gutter grabs so
+    callers can pick the nearest abutting edge when the pointer is in a gap.
+    """
+    hp, cp = _clamp_handle_px(ww, hh, handle_px, corner_px)
+    # Reject points nowhere near the rect (interior or exterior band).
+    if px < x - hp or px >= x + ww + hp or py < y - hp or py >= y + hh + hp:
+        return None
+
+    inside = x <= px < x + ww and y <= py < y + hh
+    d_left = px - x  # 0 on edge, <0 outside left, >0 inside
+    d_right = (x + ww) - px
+    d_top = py - y
+    d_bottom = (y + hh) - py
+
+    near_left = -hp <= d_left <= cp
+    near_right = -hp <= d_right <= cp
+    near_top = -hp <= d_top <= cp
+    near_bottom = -hp <= d_bottom <= cp
+
+    # Corners first (larger target than edges).
+    if near_top and near_left and d_left <= cp and d_top <= cp:
+        dist = 0.0 if inside else float(max(0, -d_left, -d_top))
+        return "top-left", dist
+    if near_top and near_right and d_right <= cp and d_top <= cp:
+        dist = 0.0 if inside else float(max(0, -d_right, -d_top))
+        return "top-right", dist
+    if near_bottom and near_left and d_left <= cp and d_bottom <= cp:
+        dist = 0.0 if inside else float(max(0, -d_left, -d_bottom))
+        return "bottom-left", dist
+    if near_bottom and near_right and d_right <= cp and d_bottom <= cp:
+        dist = 0.0 if inside else float(max(0, -d_right, -d_bottom))
+        return "bottom-right", dist
+
+    # Edges — require proximity on the primary axis within handle_px, and stay
+    # within the segment (expanded by hp so gutters between tiles still count).
+    if -hp <= d_left <= hp and (y - hp) <= py < (y + hh + hp):
+        dist = 0.0 if inside else float(max(0, -d_left))
+        return "left", dist
+    if -hp <= d_right <= hp and (y - hp) <= py < (y + hh + hp):
+        dist = 0.0 if inside else float(max(0, -d_right))
+        return "right", dist
+    if -hp <= d_top <= hp and (x - hp) <= px < (x + ww + hp):
+        dist = 0.0 if inside else float(max(0, -d_top))
+        return "top", dist
+    if -hp <= d_bottom <= hp and (x - hp) <= px < (x + ww + hp):
+        dist = 0.0 if inside else float(max(0, -d_bottom))
+        return "bottom", dist
+
+    if inside:
+        return "body", 0.0
+    return None
+
+
 def hit_test_handle(
     windows: list[dict[str, Any]],
     px: int,
@@ -690,37 +769,42 @@ def hit_test_handle(
 ) -> tuple[int, Handle] | None:
     """Return (index, handle) under point, preferring corners then edges then body.
 
-    Topmost (highest index) window wins when rects overlap — unusual for a grid
-    but keeps the editor predictable if the user stacked floats beforehand.
+    Hits extend *outside* the rect by ``handle_px`` so the gutter between tiled
+    windows still grabs the nearest edge/corner (previously a dead zone that
+    forced body-drag reorder). Interior edge/corner of a containing window
+    beats exterior gutter hits; among gutters the nearest edge wins. Topmost
+    (highest index) window wins for interior body when rects overlap.
     """
-    for i in range(len(windows) - 1, -1, -1):
-        w = windows[i]
-        x, y, ww, hh = _as_rect(w)
-        if not (x <= px < x + ww and y <= py < y + hh):
-            continue
-        left = px - x <= corner_px
-        right = (x + ww) - px <= corner_px
-        top = py - y <= corner_px
-        bottom = (y + hh) - py <= corner_px
-        if top and left:
-            return i, "top-left"
-        if top and right:
-            return i, "top-right"
-        if bottom and left:
-            return i, "bottom-left"
-        if bottom and right:
-            return i, "bottom-right"
-        if px - x <= handle_px:
-            return i, "left"
-        if (x + ww) - px <= handle_px:
-            return i, "right"
-        if py - y <= handle_px:
-            return i, "top"
-        if (y + hh) - py <= handle_px:
-            return i, "bottom"
-        return i, "body"
-    return None
+    interior_resize: tuple[int, Handle] | None = None
+    interior_body: tuple[int, Handle] | None = None
+    best_exterior: tuple[float, int, Handle] | None = None
 
+    for i in range(len(windows) - 1, -1, -1):
+        x, y, ww, hh = _as_rect(windows[i])
+        classified = _classify_handle_for_rect(
+            px, py, x, y, ww, hh, handle_px, corner_px
+        )
+        if classified is None:
+            continue
+        handle, dist = classified
+        inside = x <= px < x + ww and y <= py < y + hh
+        if inside:
+            if handle != "body":
+                if interior_resize is None:
+                    interior_resize = (i, handle)
+            elif interior_body is None:
+                interior_body = (i, "body")
+        elif handle != "body":
+            if best_exterior is None or dist < best_exterior[0]:
+                best_exterior = (dist, i, handle)
+
+    if interior_resize is not None:
+        return interior_resize
+    if best_exterior is not None:
+        return best_exterior[1], best_exterior[2]
+    if interior_body is not None:
+        return interior_body
+    return None
 
 def window_at(
     windows: list[dict[str, Any]],

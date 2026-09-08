@@ -432,6 +432,18 @@ class ArrangeCanvas(Gtk.DrawingArea):
     def _on_drag_begin(self, _gesture, x: float, y: float) -> None:
         gx, gy = self._to_global(x, y)
         hit = hit_test_handle(self.windows, gx, gy, handle_px=HANDLE_PX)
+        # Prefer the hover handle when the pointer hasn't left the tile —
+        # motion already resolved edge/corner with the same hit test, and
+        # reusing it avoids a body-drag steal if the press jittered a pixel.
+        if (
+            hit is not None
+            and self._hover_index is not None
+            and self._hover_handle
+            and self._hover_handle != "body"
+            and hit[0] == self._hover_index
+            and (hit[1] == "body" or hit[1] == self._hover_handle)
+        ):
+            hit = (self._hover_index, self._hover_handle)
         if hit is None:
             self._drag_index = None
             return
@@ -448,7 +460,6 @@ class ArrangeCanvas(Gtk.DrawingArea):
             name = "grabbing"
         cur = Gdk.Cursor.new_from_name(name) or Gdk.Cursor.new_from_name("default")
         self.set_cursor(cur)
-
     def _on_drag_update(self, _gesture, offset_x: float, offset_y: float) -> None:
         if self._drag_index is None or self._drag_origin_windows is None:
             return
@@ -626,31 +637,32 @@ class ArrangeCanvas(Gtk.DrawingArea):
         self._round_rect(cr, lx, ly, lw, lh, 10)
         cr.stroke()
 
-        # Edge/corner handle ticks.
+        # Edge/corner handle ticks — sized to match the grab zones so the
+        # user can see where resize will pick up (not just body reorder).
         cr.set_source_rgba(*COL_HANDLE)
-        cr.set_line_width(3)
+        cr.set_line_width(3.5)
         mid_x = lx + lw / 2
         mid_y = ly + lh / 2
-        tick = 18
-        cr.move_to(mid_x - tick / 2, ly + 5)
-        cr.line_to(mid_x + tick / 2, ly + 5)
-        cr.move_to(mid_x - tick / 2, ly + lh - 5)
-        cr.line_to(mid_x + tick / 2, ly + lh - 5)
-        cr.move_to(lx + 5, mid_y - tick / 2)
-        cr.line_to(lx + 5, mid_y + tick / 2)
-        cr.move_to(lx + lw - 5, mid_y - tick / 2)
-        cr.line_to(lx + lw - 5, mid_y + tick / 2)
+        tick = 28
+        inset = 7
+        cr.move_to(mid_x - tick / 2, ly + inset)
+        cr.line_to(mid_x + tick / 2, ly + inset)
+        cr.move_to(mid_x - tick / 2, ly + lh - inset)
+        cr.line_to(mid_x + tick / 2, ly + lh - inset)
+        cr.move_to(lx + inset, mid_y - tick / 2)
+        cr.line_to(lx + inset, mid_y + tick / 2)
+        cr.move_to(lx + lw - inset, mid_y - tick / 2)
+        cr.line_to(lx + lw - inset, mid_y + tick / 2)
         cr.stroke()
 
         for cx, cy in (
-            (lx + 6, ly + 6),
-            (lx + lw - 6, ly + 6),
-            (lx + 6, ly + lh - 6),
-            (lx + lw - 6, ly + lh - 6),
+            (lx + 8, ly + 8),
+            (lx + lw - 8, ly + 8),
+            (lx + 8, ly + lh - 8),
+            (lx + lw - 8, ly + lh - 8),
         ):
-            cr.arc(cx, cy, 3.5, 0, 2 * math.pi)
+            cr.arc(cx, cy, 5.0, 0, 2 * math.pi)
             cr.fill()
-
         label = (w.get("class") or w.get("title") or "window").strip() or "window"
         if len(label) > 28:
             label = label[:27] + "…"

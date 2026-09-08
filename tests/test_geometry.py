@@ -447,8 +447,38 @@ class TestHitTest(unittest.TestCase):
         hit = hit_test_handle(self.wins, 295, 175, handle_px=10)
         self.assertEqual(hit, (0, "right"))
 
+    def test_right_edge_default_zone(self):
+        # Default HANDLE_PX is large enough that interior near-edge is resize.
+        hit = hit_test_handle(self.wins, 100 + 200 - 20, 175)
+        self.assertEqual(hit, (0, "right"))
+
     def test_top_left_corner(self):
         hit = hit_test_handle(self.wins, 105, 105, corner_px=14)
+        self.assertEqual(hit, (0, "top-left"))
+
+    def test_top_left_corner_default_zone(self):
+        hit = hit_test_handle(self.wins, 100 + 20, 100 + 20)
+        self.assertEqual(hit, (0, "top-left"))
+
+    def test_exterior_gutter_grabs_nearest_edge(self):
+        # Point in the gap just past the right edge still picks resize, not miss.
+        hit = hit_test_handle(self.wins, 100 + 200 + 8, 175)
+        self.assertEqual(hit, (0, "right"))
+
+    def test_gutter_between_tiles_picks_nearest(self):
+        # 12px gap between A and B — classic dead zone before exterior hits.
+        wins = [
+            tile(0, 0, 0, 100, 100),
+            tile(1, 112, 0, 100, 100),
+        ]
+        # Mid-gutter should grab an edge (either A's right or B's left).
+        hit = hit_test_handle(wins, 106, 50, handle_px=28)
+        self.assertIsNotNone(hit)
+        self.assertIn(hit[1], ("right", "left"))
+        self.assertIn(hit[0], (0, 1))
+
+    def test_corner_exterior(self):
+        hit = hit_test_handle(self.wins, 100 - 6, 100 - 6)
         self.assertEqual(hit, (0, "top-left"))
 
     def test_miss(self):
@@ -461,7 +491,6 @@ class TestHitTest(unittest.TestCase):
         ]
         self.assertEqual(window_at(wins, 60, 60), 1)
         self.assertEqual(window_at(wins, 60, 60, exclude=1), 0)
-
 
 if __name__ == "__main__":
     unittest.main()
