@@ -219,132 +219,36 @@ for line in sys.stdin:
   exit 0
 fi
 
-# One hyprctl eval: Lua dispatchers place every window. Live client state is
-# read inside the eval so fullscreen/pinned/tags stay accurate.
+# apply.py: soften min_size rules, strip Omarchy float tags, resize+move with
+# a settle pass so Chromium/Goose toolkit clamps cannot leave overlaps.
 RESULT=$(
   PLAN=$PLAN \
+  LAYOUT_DIR=$LAYOUT_DIR \
+  ROOT=$ROOT \
   python3 - <<'PY'
-import json, os, subprocess, sys, time
+import json, os, sys
+
+sys.path.insert(0, os.environ.get("LAYOUT_DIR", ""))
+sys.path.insert(0, os.environ.get("ROOT", ""))
+from apply import apply_plan  # noqa: E402
 
 plan = [json.loads(l) for l in os.environ["PLAN"].splitlines() if l.strip()]
 if not plan:
     print("count=0")
     sys.exit(0)
 
-try:
-    clients = {
-        c["address"]: c
-        for c in json.loads(
-            subprocess.check_output(["hyprctl", "clients", "-j"], text=True)
-        )
-    }
-except Exception as e:
-    print(f"error=clients:{e}", file=sys.stderr)
-    clients = {}
-
-
-def lua_str(s: str) -> str:
-    return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
-
-
-def fs_mode(value) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return 1 if value else 0
-
-
-# Build a single Lua chunk. Hyprland 0.56 notes:
-#   - fullscreen mode=false exits; mode=0 toggles into maximized
-#   - float({on=true}) is idempotent (toggle would thrash already-floating)
-#   - Omarchy tags floating-window* attach size={875,600}/center rules; strip
-#     them before resize/move so the planned cell sticks
-#   - apply geometry twice: first float can re-trigger window rules; second
-#     pass locks the planned cell without sleeps
-lines: list[str] = [
-    # Hyprland 0.56 notes (verified on Omarchy):
-    #   - fullscreen({mode=false}) toggles when already off → only if need_fs
-    #   - maximized (fs=1) needs two mode=false calls (1→2→0)
-    #   - window.float always toggles (on/floating/action args ignored) → only
-    #     if the live client is tiled
-    #   - strip Omarchy floating-window*/pop tags so size/center rules don't fight
-    "local function apply(w, x, y, rw, rh, need_fs, need_float, need_pin)",
-    "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-floating-window*' })) end)",
-    "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-floating-window' })) end)",
-    "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-pop' })) end)",
-    "  pcall(function() hl.dispatch(hl.dsp.window.tag({ window = w, tag = '-pop*' })) end)",
-    "  if need_fs then",
-    "    hl.dispatch(hl.dsp.window.fullscreen({ window = w, mode = false }))",
-    "    hl.dispatch(hl.dsp.window.fullscreen({ window = w, mode = false }))",
-    "  end",
-    "  if need_pin then",
-    "    pcall(function() hl.dispatch(hl.dsp.window.pin({ window = w })) end)",
-    "  end",
-    "  if need_float then",
-    "    hl.dispatch(hl.dsp.window.float({ window = w }))",
-    "  end",
-    "  hl.dispatch(hl.dsp.window.resize({ window = w, x = rw, y = rh }))",
-    "  hl.dispatch(hl.dsp.window.move({ window = w, x = x, y = y }))",
-    # Second geometry pass: rules can reflow once after the first float.
-    "  hl.dispatch(hl.dsp.window.resize({ window = w, x = rw, y = rh }))",
-    "  hl.dispatch(hl.dsp.window.move({ window = w, x = x, y = y }))",
-    "end",
-]
-
-for p in plan:
-    addr = p["address"]
-    live = clients.get(addr, {})
-    fs_i = fs_mode(live.get("fullscreen", p.get("fullscreen") or 0))
-    floating = bool(live.get("floating", p.get("floating")))
-    pinned = bool(live.get("pinned", p.get("pinned")))
-    # Omarchy "pop" tag means pinned float; pin dispatcher toggles off.
-    tags = live.get("tags") or []
-    if any(str(t).rstrip("*") == "pop" for t in tags):
-        pinned = True
-    # window.float toggles. Only call it when currently tiled. Exiting a
-    # tiled maximize leaves the window tiled (need float); exiting a floating
-    # maximize leaves it floating (skip float or we toggle back to tiled).
-    need_float = not floating
-    lines.append(
-        "apply(%s, %d, %d, %d, %d, %s, %s, %s)"
-        % (
-            lua_str(f"address:{addr}"),
-            int(p["x"]),
-            int(p["y"]),
-            int(p["w"]),
-            int(p["h"]),
-            "true" if fs_i else "false",
-            "true" if need_float else "false",
-            "true" if pinned else "false",
-        )
-    )
-
-lines.append(f'print("arranged={len(plan)}")')
-lua = "\n".join(lines)
-
-t0 = time.monotonic()
-proc = subprocess.run(
-    ["hyprctl", "eval", lua],
-    text=True,
-    capture_output=True,
-)
-dt = (time.monotonic() - t0) * 1000
-
+result = apply_plan(plan, refresh_clients=True, settle_retry=True)
 for p in plan:
     print(
         f"OK {p['role']} {p.get('class', ''):<12} → {p['w']}x{p['h']} @ {p['x']},{p['y']}"
     )
-
-print(f"count={len(plan)}")
-print(f"ms={dt:.0f}")
-print(f"eval_rc={proc.returncode}")
-# hyprctl eval prints "ok" on success; keep stderr noise small.
-err = (proc.stderr or "").strip()
-if proc.returncode != 0 and err:
-    print(f"eval_err={err[:300]}", file=sys.stderr)
-elif "error:" in (proc.stdout or "").lower():
-    # Some builds put Lua errors on stdout.
-    print(f"eval_out={(proc.stdout or '').strip()[:300]}", file=sys.stderr)
+print(f"count={result.get('count', len(plan))}")
+print(f"ms={result.get('ms', 0):.0f}")
+print(f"eval_rc={result.get('eval_rc', 0)}")
+if result.get("settled"):
+    print(f"settled={result['settled']}")
+if result.get("error"):
+    print(f"eval_err={result['error']}", file=sys.stderr)
 PY
 ) || true
 

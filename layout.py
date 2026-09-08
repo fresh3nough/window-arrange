@@ -88,15 +88,52 @@ def wants_tall(c: dict[str, Any]) -> bool:
     return any(n in cls or n in title for n in needles)
 
 
+def toolkit_min_size(c: dict[str, Any]) -> tuple[int, int]:
+    """Observed Wayland min sizes on Omarchy HiDPI (logical px).
+
+    Clients silently refuse smaller resize requests and keep their min frame,
+    which shifts a center-anchored resize into neighboring cells. Planning at
+    or above these floors keeps top-left placement honest.
+    """
+    cls = (c.get("class") or "").lower()
+    title = (c.get("title") or "").lower()
+    # Browsers: hard min width ~500; height is flexible.
+    if any(
+        n in cls or n in title
+        for n in (
+            "chromium",
+            "chrome",
+            "firefox",
+            "brave",
+            "msedge",
+            "vivaldi",
+            "zen",
+            "librewolf",
+        )
+    ):
+        return 500, 200
+    # Electron / Goose: both axes clamp.
+    if any(n in cls or n in title for n in ("goose", "electron", "slack", "discord", "code", "cursor", "1password")):
+        return 480, 400
+    # GTK file manager: min height ~380, width ~360.
+    if "nautilus" in cls or "nautilus" in title:
+        return 360, 380
+    if "diskutility" in cls or "gnome-disks" in cls or "baobab" in cls:
+        return 360, 200
+    return 200, 120
+
+
 def min_cell_width_for(grid_w: int, gap: int) -> int:
     """Largest per-cell width we can demand and still fit two gutters on a row.
 
     Used to cap column count so toolkit min-size clamps cannot spill.
+    Chromium's hard min is ~500 logical px on this HiDPI panel.
     """
-    # Observed: Goose ~480, Chromium ~500 on logical ~1440 canvases.
     target = 500
-    # Hard floor still leaves room for 2-col layouts on small screens.
-    return max(360, min(target, (grid_w - gap) // 2 if grid_w > gap else target))
+    # Never demand more than half the grid (2-col always fits target when grid
+    # is wide enough); still allow narrower grids to drop the target.
+    half = (grid_w - gap) // 2 if grid_w > gap else target
+    return max(360, min(target, half))
 
 
 def adaptive_defaults(area_w: int, area_h: int) -> dict[str, int]:
@@ -243,6 +280,49 @@ def row_counts_for(n: int, cols: int, rows: int) -> list[int]:
     return counts
 
 
+def split_axis_weighted(
+    total: int, weights: list[int], gap: int
+) -> list[tuple[int, int]]:
+    """Partition `total` px into len(weights) segments by relative weight + gap.
+
+    Guarantees each segment is at least 1px and the span covers `total` exactly
+    (same contract as split_axis). Weights are clamped to >= 1.
+    """
+    n = len(weights)
+    if n <= 0:
+        return []
+    if n == 1:
+        return [(0, max(1, total))]
+    gap = max(0, gap)
+    usable = total - gap * (n - 1)
+    if usable < n:
+        usable = n
+    wts = [max(1, int(w)) for w in weights]
+    wsum = sum(wts)
+    raw = [usable * w / wsum for w in wts]
+    sizes = [max(1, int(v)) for v in raw]
+    # Fix rounding drift so sum(sizes) == usable.
+    drift = usable - sum(sizes)
+    i = 0
+    while drift != 0 and n > 0:
+        if drift > 0:
+            sizes[i % n] += 1
+            drift -= 1
+        else:
+            if sizes[i % n] > 1:
+                sizes[i % n] -= 1
+                drift += 1
+        i += 1
+        if i > n * (abs(drift) + 2):
+            break
+    out: list[tuple[int, int]] = []
+    pos = 0
+    for size in sizes:
+        out.append((pos, size))
+        pos += size + gap
+    return out
+
+
 def place_column_stacks(
     n: int,
     grid_x0: int,
@@ -250,26 +330,36 @@ def place_column_stacks(
     grid_w: int,
     grid_h: int,
     gap: int,
+    height_weights: list[list[int]] | None = None,
 ) -> list[tuple[int, int, int, int]]:
     """Two-column stack layout for counts that cannot form a safe uniform grid.
 
     Example n=5 → left stack of 3 + right stack of 2. Every cell is ~half the
-    work-area wide (browser-safe). The shorter stack gets taller rows so
-    electron/goose min-heights fit; the taller stack holds flexible apps.
+    work-area wide (browser-safe ≥ Chromium 500). Optional per-column
+    height_weights (left list, right list) grow tall-min apps inside a stack
+    so Goose/Electron keep ≥400px without overlapping neighbors.
     Cells are returned left-stack first (top→bottom), then right-stack.
     """
     if n <= 0:
         return []
-    # Prefer a slightly larger right stack when odd: right gets fewer, taller cells.
     right_n = n // 2
     left_n = n - right_n
-    # For 5: left 3, right 2. For 7: left 4, right 3.
+    # For 5: left 3 flexible, right 2 taller. For 7: left 4, right 3.
     if n == 5:
         left_n, right_n = 3, 2
     col_bands = split_axis(grid_w, 2, gap)
+    counts = (left_n, right_n)
     cells: list[tuple[int, int, int, int]] = []
-    for (cx, cw), count in ((col_bands[0], left_n), (col_bands[1], right_n)):
-        row_bands = split_axis(grid_h, count, gap)
+    for col_i, ((cx, cw), count) in enumerate(zip(col_bands, counts)):
+        if count <= 0:
+            continue
+        weights = None
+        if height_weights is not None and col_i < len(height_weights):
+            weights = height_weights[col_i]
+        if weights is not None and len(weights) == count:
+            row_bands = split_axis_weighted(grid_h, weights, gap)
+        else:
+            row_bands = split_axis(grid_h, count, gap)
         for ry, rh in row_bands:
             cells.append((grid_x0 + cx, grid_y0 + ry, cw, rh))
     return cells
@@ -282,42 +372,44 @@ def place_grid(
     grid_w: int,
     grid_h: int,
     gap: int,
+    *,
+    min_cell_w: int | None = None,
 ) -> list[tuple[int, int, int, int]]:
     """Return n non-overlapping (x, y, w, h) cells covering the grid with gutters.
 
     Uses a uniform row grid when every cell can stay at toolkit-safe size.
-    Falls back to two-column stacks when a uniform grid would force sub-min
-    widths (the five-app HiDPI case: 3-col ~461px < Chromium/Goose clamp).
+    Falls back to two-column stacks whenever a uniform grid would force a cell
+    narrower than Chromium's ~500px clamp (5- and 6-up on ~1440 logical).
     """
     if n <= 0:
         return []
-    prefer_cw = min_cell_width_for(grid_w, gap)
+    prefer_cw = min_cell_w if min_cell_w is not None else min_cell_width_for(grid_w, gap)
     prefer_rh = 400
     cols, rows = choose_grid(n, grid_w, grid_h, gap)
     if cols <= 0 or rows <= 0:
         return []
 
-    # Uniform grid safe if the densest row still meets min width and height.
     densest_cols = cols
     if n == 5 and rows == 2:
         densest_cols = 3  # 2+3 layout
     densest_cw = (grid_w - gap * (densest_cols - 1)) / max(densest_cols, 1)
     densest_rh = (grid_h - gap * (rows - 1)) / max(rows, 1)
-    soft_cw = max(160, min(prefer_cw, 460))
-    # Five-up on ~1400-wide: 2+3 cells are ~461px < Chromium/Goose clamp (~500).
-    # Always use two-column stacks there. Six-up 3x2 (~460x440) keeps height and
-    # is preferred over dual 3-stacks (~700x292) that crush Goose min-height.
-    if n == 5 and densest_cw < prefer_cw and grid_w >= prefer_cw * 2 + gap:
+
+    # Any time the densest cell would be under the toolkit floor AND two
+    # half-width columns still clear that floor, use stacks. Covers 5-up and
+    # 6-up on HiDPI (~461px 3-col cells vs Chromium 500).
+    can_stack = grid_w >= prefer_cw * 2 + gap
+    if can_stack and densest_cw + 0.5 < prefer_cw:
         return place_column_stacks(n, grid_x0, grid_y0, grid_w, grid_h, gap)
-    needs_stacks = (
-        n >= 6
-        and grid_w >= prefer_cw * 2 + gap
+    # Secondary: height-crushed multi-row with soft width miss.
+    soft_cw = max(160, min(prefer_cw, 460))
+    if (
+        can_stack
+        and n >= 5
         and densest_cw < soft_cw
         and densest_rh < prefer_rh
-        # Even-count 2-row grids that clear soft width keep uniform cells.
         and not (n % 2 == 0 and rows == 2 and densest_cw >= soft_cw)
-    )
-    if needs_stacks:
+    ):
         return place_column_stacks(n, grid_x0, grid_y0, grid_w, grid_h, gap)
 
     counts = row_counts_for(n, cols, rows)
@@ -332,6 +424,16 @@ def place_grid(
     return cells
 
 
+def _window_demand(c: dict[str, Any]) -> tuple[int, int, int]:
+    """Sort key: taller/wider toolkit mins first."""
+    mw, mh = toolkit_min_size(c)
+    return (
+        2 if wants_tall(c) else 0,
+        2 if wants_wide(c) else 0,
+        mh + mw,
+    )
+
+
 def assign_windows_to_cells(
     windows: list[dict[str, Any]],
     cells: list[tuple[int, int, int, int]],
@@ -339,7 +441,6 @@ def assign_windows_to_cells(
     """Match windows to cells: min-size-heavy apps get the tallest+widest cells first."""
     if not windows or not cells:
         return []
-    # Height first (Goose clamps ~400), then width (~480), then area.
     cell_order = sorted(
         range(len(cells)),
         key=lambda i: (cells[i][3], cells[i][2], cells[i][2] * cells[i][3]),
@@ -348,8 +449,7 @@ def assign_windows_to_cells(
     win_order = sorted(
         range(len(windows)),
         key=lambda i: (
-            2 if wants_tall(windows[i]) else 0,
-            2 if wants_wide(windows[i]) else 0,
+            _window_demand(windows[i]),
             (windows[i].get("class") or "").lower(),
         ),
         reverse=True,
@@ -374,6 +474,109 @@ def assign_windows_to_cells(
         if p is not None:
             out.append(p)
     return out
+
+
+def _group_cells_by_column(
+    cells: list[tuple[int, int, int, int]],
+) -> list[list[int]]:
+    """Indices of cells sharing the same x, top→bottom within each column."""
+    if not cells:
+        return []
+    by_x: dict[int, list[int]] = {}
+    for i, (x, _y, _w, _h) in enumerate(cells):
+        by_x.setdefault(x, []).append(i)
+    cols = []
+    for x in sorted(by_x):
+        idxs = by_x[x]
+        idxs.sort(key=lambda i: cells[i][1])
+        cols.append(idxs)
+    return cols
+
+
+def fit_pairs_to_toolkit_mins(
+    pairs: list[tuple[dict[str, Any], tuple[int, int, int, int]]],
+    gap: int,
+) -> list[tuple[dict[str, Any], tuple[int, int, int, int]]]:
+    """Re-flow heights inside each column so toolkit min-heights fit.
+
+    Width is already half-grid (≥ Chromium 500) in stack mode. When a column
+    has three equal ~292px rows, Goose's 400px clamp overflows; this boosts
+    tall cells and shrinks flexible ones (terminals) so the column still
+    packs exactly with gutters and no overlap.
+    """
+    if not pairs:
+        return []
+    cells = [cell for _w, cell in pairs]
+    col_groups = _group_cells_by_column(cells)
+    # Work on a mutable copy of cell geometry.
+    new_cells: list[tuple[int, int, int, int]] = [c for c in cells]
+
+    for idxs in col_groups:
+        if len(idxs) <= 1:
+            # Still bump single cell to min if needed (clips only if grid too small).
+            i = idxs[0]
+            wwin, (x, y, w, h) = pairs[i]
+            _mw, mh = toolkit_min_size(wwin)
+            if h < mh:
+                new_cells[i] = (x, y, w, h)  # can't grow without a donor
+            continue
+
+        # Column vertical span from current cells.
+        top = min(new_cells[i][1] for i in idxs)
+        bottom = max(new_cells[i][1] + new_cells[i][3] for i in idxs)
+        total_h = bottom - top
+        x = new_cells[idxs[0]][0]
+        w = new_cells[idxs[0]][2]
+
+        weights: list[int] = []
+        for i in idxs:
+            wwin = pairs[i][0]
+            _mw, mh = toolkit_min_size(wwin)
+            # Weight by min height; flexible apps keep a modest floor so they
+            # still remain usable after donors give space to Goose/Chromium.
+            base = max(mh, 160)
+            if wants_tall(wwin):
+                base = max(base, 400)
+            if wants_wide(wwin) and not wants_tall(wwin):
+                base = max(base, 220)
+            weights.append(base)
+
+        # If mins cannot fit even when flexible apps go to absolute floor,
+        # clamp weights so split still covers the column (overlap-free always).
+        min_floor = 80
+        floors = []
+        for i in idxs:
+            _mw, mh = toolkit_min_size(pairs[i][0])
+            floors.append(max(min_floor, min(mh, total_h // len(idxs))))
+        # Prefer honoring weights; split_axis_weighted always fills total_h.
+        bands = split_axis_weighted(total_h, weights, gap)
+        for band_i, cell_i in enumerate(idxs):
+            ry, rh = bands[band_i]
+            new_cells[cell_i] = (x, top + ry, w, rh)
+
+    return [(pairs[i][0], new_cells[i]) for i in range(len(pairs))]
+
+
+def pack_window_cells(
+    windows: list[dict[str, Any]],
+    grid_x0: int,
+    grid_y0: int,
+    grid_w: int,
+    grid_h: int,
+    gap: int,
+) -> list[tuple[dict[str, Any], tuple[int, int, int, int]]]:
+    """Plan non-overlapping cells sized for the windows' toolkit mins."""
+    n = len(windows)
+    if n <= 0:
+        return []
+    # Demand the max observed min-width among this set so Chromium forces stacks.
+    demand_w = max((toolkit_min_size(w)[0] for w in windows), default=500)
+    prefer_cw = max(min_cell_width_for(grid_w, gap), min(demand_w, (grid_w - gap) // 2 if grid_w > gap else demand_w))
+    cells = place_grid(
+        n, grid_x0, grid_y0, grid_w, grid_h, gap, min_cell_w=prefer_cw
+    )
+    pairs = assign_windows_to_cells(windows, cells)
+    return fit_pairs_to_toolkit_mins(pairs, gap)
 
 
 def build_plan(
@@ -472,9 +675,15 @@ def build_plan(
     n = len(others)
 
     if n > 0:
-        cells = place_grid(n, grid_x0, grid_y0, grid_w, grid_h, gap_i)
+        pairs = pack_window_cells(others, grid_x0, grid_y0, grid_w, grid_h, gap_i)
         cols, rows = choose_grid(n, grid_w, grid_h, gap_i)
-        for c, (cx, cy, cell_w, cell_h) in assign_windows_to_cells(others, cells):
+        # Reflect stack mode in meta when densest uniform cell would be too narrow.
+        prefer_cw = min_cell_width_for(grid_w, gap_i)
+        densest = (grid_w - gap_i * (max(cols, 1) - 1)) / max(cols, 1) if cols else grid_w
+        if densest + 0.5 < prefer_cw and grid_w >= prefer_cw * 2 + gap_i:
+            cols, rows = 2, max(1, (n + 1) // 2)
+        for c, (cx, cy, cell_w, cell_h) in pairs:
+            mw, mh = toolkit_min_size(c)
             plan.append(
                 {
                     "address": c["address"],
@@ -488,12 +697,15 @@ def build_plan(
                     "fullscreen": c.get("fullscreen") not in (0, False, None),
                     "floating": bool(c.get("floating")),
                     "pinned": bool(c.get("pinned")),
+                    "min_w": int(mw),
+                    "min_h": int(mh),
                     "meta": {
                         "gap": gap_i,
                         "outer": outer_i,
                         "cols": cols,
                         "rows": rows,
                         "logical": list(logical_monitor_box(mon)[2:4]),
+                        "toolkit_min": [int(mw), int(mh)],
                     },
                 }
             )

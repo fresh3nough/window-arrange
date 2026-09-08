@@ -18,9 +18,11 @@ from layout import (  # noqa: E402
     build_plan,
     choose_grid,
     logical_monitor_box,
+    pack_window_cells,
     place_grid,
     rects_overlap,
     split_axis,
+    toolkit_min_size,
     work_area,
 )
 
@@ -121,16 +123,16 @@ class TestPlaceGrid(unittest.TestCase):
         # Match adaptive work area on this laptop-ish canvas.
         x0, y0, x1, y1, aw, ah = work_area(mon_hidpi(), outer=16)
         gap = 12
-        cells = place_grid(5, x0, y0, aw, ah, gap)
+        # Chromium's 500px floor forces 2-col stacks (~698px half-width).
+        cells = place_grid(5, x0, y0, aw, ah, gap, min_cell_w=500)
         self.assertEqual(len(cells), 5)
         for i, a in enumerate(cells):
             for b in cells[i + 1 :]:
                 self.assertFalse(rects_overlap(a, b), f"{a} vs {b}")
-        # Column stacks: every cell half-width (browser-safe); right stack taller.
         widths = sorted(w for _x, _y, w, _h in cells)
         heights = sorted(h for _x, _y, _w, h in cells)
         for _x, _y, w, h in cells:
-            self.assertGreaterEqual(w, 600)  # half of ~1400
+            self.assertGreaterEqual(w, 600)  # half of ~1408
             self.assertLessEqual(_x + w, x1)
             self.assertLessEqual(_y + h, y1)
         # 2-stack side must clear Goose min height (~400).
@@ -144,20 +146,41 @@ class TestPlaceGrid(unittest.TestCase):
         self.assertGreaterEqual(rows, 1)
         self.assertGreaterEqual(cols, 1)
 
-    def test_six_windows_prefer_three_by_two(self):
-        # On HiDPI logical ~1408x902, 3x2 keeps ~440px rows (Goose-safe).
-        # 2x3 / dual 3-stacks crush height to ~292.
-        cols, rows = choose_grid(6, 1408, 902, 12)
-        self.assertEqual((cols, rows), (3, 2))
-        cells = place_grid(6, 16, 42, 1408, 902, 12)
+    def test_six_windows_stack_when_chromium_min_blocks_three_col(self):
+        # 3x2 on ~1408-wide yields ~461px cells < Chromium 500 → must stack.
+        cells = place_grid(6, 16, 42, 1408, 902, 12, min_cell_w=500)
         self.assertEqual(len(cells), 6)
-        heights = [h for _x, _y, _w, h in cells]
         widths = [w for _x, _y, w, _h in cells]
-        self.assertTrue(all(h >= 400 for h in heights), heights)
-        self.assertTrue(all(w >= 440 for w in widths), widths)
+        # Two columns, each ≥ Chromium min.
+        self.assertTrue(all(w >= 500 for w in widths), widths)
         for i, a in enumerate(cells):
             for b in cells[i + 1 :]:
                 self.assertFalse(rects_overlap(a, b), f"{a} vs {b}")
+
+    def test_pack_mixed_toolkit_mins_no_overlap(self):
+        x0, y0, x1, y1, aw, ah = work_area(mon_hidpi(), outer=16)
+        wins = [
+            fake_client("0x1", "chromium"),
+            fake_client("0x2", "goose"),
+            fake_client("0x3", "foot"),
+            fake_client("0x4", "org.gnome.Nautilus"),
+            fake_client("0x5", "org.gnome.DiskUtility"),
+            fake_client("0x6", "chromium", title="about:blank"),
+        ]
+        pairs = pack_window_cells(wins, x0, y0, aw, ah, 12)
+        self.assertEqual(len(pairs), 6)
+        cells = [cell for _w, cell in pairs]
+        for i, a in enumerate(cells):
+            for b in cells[i + 1 :]:
+                self.assertFalse(rects_overlap(a, b), f"{a} vs {b}")
+        # Wide apps land in cells at least as wide as their toolkit min when possible.
+        for win, (x, y, w, h) in pairs:
+            mw, mh = toolkit_min_size(win)
+            if mw >= 480:
+                self.assertGreaterEqual(w, 500, msg=(win["class"], w, mw))
+            # Goose gets a tall cell when packing can spare it.
+            if win["class"] == "goose":
+                self.assertGreaterEqual(h, 350, msg=(h, mh))
 
 
 class TestPlanBounds(unittest.TestCase):
@@ -193,10 +216,10 @@ class TestPlanBounds(unittest.TestCase):
         for item in plan:
             self.assertLess(item["x"], 1440, msg=f"off-screen x: {item}")
             self.assertLess(item["y"], 960, msg=f"off-screen y: {item}")
-            # Column-stack / safe grid: half-width cells stay above toolkit clamps.
-            self.assertGreaterEqual(item["w"], 480, msg=item)
+            # 2-col stacks: half-width ≥ Chromium 500.
+            self.assertGreaterEqual(item["w"], 500, msg=item)
 
-    def test_hidpi_six_windows_two_row_heights(self):
+    def test_hidpi_six_mixed_apps_no_overlap(self):
         mon = mon_hidpi()
         clients = [
             fake_client("0x1", "chromium"),
@@ -213,10 +236,37 @@ class TestPlanBounds(unittest.TestCase):
         self.assertEqual(len(plan), 6)
         self._assert_in_logical(plan, mon, outer=16)
         assert_no_plan_overlap(self, plan)
-        # Prefer 3x2 so Goose/Electron clear ~400px height.
+        # Stacks give ≥500 width so Chromium cannot spill into neighbors.
         for item in plan:
-            self.assertGreaterEqual(item["h"], 400, msg=item)
-            self.assertGreaterEqual(item["w"], 440, msg=item)
+            self.assertGreaterEqual(item["w"], 500, msg=item)
+        # Goose (tall) should receive a weighted-taller cell when possible.
+        goose = next(p for p in plan if p["class"] == "goose")
+        self.assertGreaterEqual(goose["h"], 350, msg=goose)
+
+    def test_hidpi_files_chrome_goose_foot_disks(self):
+        """Exact user mix: Nautilus + 2×Chromium + Goose + foot + Disks."""
+        mon = mon_hidpi()
+        clients = [
+            fake_client("0x1", "org.gnome.Nautilus", title="Home"),
+            fake_client("0x2", "chromium", title="LinkedIn"),
+            fake_client("0x3", "goose"),
+            fake_client("0x4", "foot", title="desktop"),
+            fake_client("0x5", "org.gnome.DiskUtility", title="Disks"),
+            fake_client("0x6", "chromium", title="about:blank"),
+        ]
+        plan = build_plan(
+            [mon], clients, {"id": 1},
+            gap=12, outer=16, auto_adapt=False,
+        )
+        self.assertEqual(len(plan), 6)
+        self._assert_in_logical(plan, mon, outer=16)
+        assert_no_plan_overlap(self, plan)
+        by_cls = {}
+        for p in plan:
+            by_cls.setdefault(p["class"], []).append(p)
+        for chrome in by_cls["chromium"]:
+            self.assertGreaterEqual(chrome["w"], 500, msg=chrome)
+        self.assertGreaterEqual(by_cls["goose"][0]["h"], 350)
 
     def test_scale1_maclike_fits(self):
         mon = mon_scale1_maclike()

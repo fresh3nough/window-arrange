@@ -6,6 +6,7 @@ Omarchy / Hyprland helper that tidies every window on the **active workspace**.
 - **Logical geometry** — plans in Hyprland logical pixels (`physical / scale`) so HiDPI panels and scale-1.0 screens share the same density
 - **Adaptive padding** — roomier gap/outer (~12/16 at reference density); override with env vars
 - **Even non-overlapping grid** — integer-split cells with true gutters; prefers browser-safe widths so min-size clamps cannot stack windows
+- **Toolkit-aware packing** — Chromium (~500w) / Goose (~480×400) force 2-column stacks + weighted heights; settle pass re-moves after clamps
 - **scrcpy / Pixel** stays a compact portrait strip on the right
 - **Interactive edit** — drag windows to swap cells; drag edges/corners to resize and push neighbors (i3-style gutters stay put)
 - **Auto on open** — every new mapped app window triggers a debounced arrange (`hl.on("window.open")`)
@@ -52,12 +53,12 @@ Hyprland **0.56+** (Omarchy) is Lua-first: legacy `hyprctl dispatch resizewindow
 is rejected, so older "batch of pixel dispatches" paths reported OK and moved
 nothing. Current path:
 
-1. One `layout.py` plan (logical px)  
+1. One `layout.py` plan (logical px) — 2-col stacks when cells would be < toolkit min  
 2. One `hyprctl clients -j` snapshot (fullscreen / pinned / tags)  
-3. One `hyprctl eval` of `hl.dsp.window.*` (strip Omarchy float tags, exit fs
-   with `mode=false`, `float({on=true})`, resize+move twice)  
+3. One `hyprctl eval` via `apply.py` (soften `min_size`, strip Omarchy float tags,
+   exit fs, float if needed, resize+move, settle pass)  
 
-Typical wall time on 5–6 windows: **~5–20ms** eval. No focus cycling, no sleeps.
+Typical wall time on 5–6 windows: **~5–20ms** eval (+~50ms settle). No focus cycling.
 
 ## Usage
 
