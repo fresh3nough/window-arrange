@@ -4,8 +4,12 @@
 --
 -- window.open fires after window rules are applied. A short oneshot debounce
 -- coalesces burst opens (boot / multi-window launch) into a single arrange.
--- A second delayed pass catches clients that map late or go fullscreen after
--- the first pass (e.g. Nautilus as a 7th window).
+-- A second delayed pass catches clients that map late after the first pass
+-- (e.g. Nautilus as a 7th window).
+--
+-- Do NOT listen for window.fullscreen: SUPER+ALT+F (Mac Super+Option+F) is
+-- Omarchy "Full width" / maximize. A fullscreen listener re-ran arrange and
+-- immediately undid the maximize (looked like the focused Chromium "closed").
 
 local M = {}
 
@@ -18,7 +22,7 @@ end
 if debounce_ms > 2000 then
   debounce_ms = 2000
 end
--- Second pass: late map / post-open fullscreen (Nautilus, Electron shells).
+-- Second pass: late map after open (Nautilus, Electron shells).
 local settle_ms = tonumber(os.getenv("WINDOW_ARRANGE_OPEN_SETTLE_MS") or "") or 450
 if settle_ms < 0 then
   settle_ms = 0
@@ -96,7 +100,7 @@ local function schedule_arrange()
       run_arrange()
     end, { timeout = debounce_ms, type = "oneshot" })
   end
-  -- Second pass after toolkit chrome settles (fullscreen / min-size apply).
+  -- Second pass after toolkit chrome settles (late map / min-size apply).
   if settle_ms > 0 then
     hl.timer(function()
       if my ~= gen then
@@ -115,15 +119,6 @@ function M.setup()
   M._bound = true
 
   hl.on("window.open", function(w)
-    if should_skip(w) then
-      return
-    end
-    schedule_arrange()
-  end)
-
-  -- Fullscreen toggles (user or app) should re-grid so a new window that
-  -- claims the monitor does not sit behind the existing float grid forever.
-  hl.on("window.fullscreen", function(w)
     if should_skip(w) then
       return
     end
