@@ -8,6 +8,7 @@ Omarchy / Hyprland helper that tidies every window on the **active workspace**.
 - **Even non-overlapping grid** — integer-split cells with true gutters; prefers browser-safe widths so min-size clamps cannot stack windows
 - **scrcpy / Pixel** stays a compact portrait strip on the right
 - **Interactive edit** — drag windows to swap cells; drag edges/corners to resize and push neighbors (i3-style gutters stay put)
+- **Auto on open** — every new mapped app window triggers a debounced arrange (`hl.on("window.open")`)
 - Works with Hyprland 0.56+ Lua dispatchers (`hl.dsp.window.*`)
 
 ## Install (other Omarchy machine)
@@ -20,7 +21,7 @@ cd window-arrange
 bash install.sh
 ```
 
-`install.sh` puts the binary and modules on `~/.local/bin` (and a copy under `~/.local/share/window-arrange`), rebinds **Super+J** (replaces dwindle togglesplit), binds **Super+B** for the interactive editor, binds **Super+Alt+A**, and hooks **`window-arrange --on-start`** into `~/.config/hypr/autostart.lua` so the grid runs after autoload apps map.
+`install.sh` puts the binary and modules on `~/.local/bin` (and a copy under `~/.local/share/window-arrange`), rebinds **Super+J** (replaces dwindle togglesplit), binds **Super+B** for the interactive editor, binds **Super+Alt+A**, installs **`~/.config/hypr/window-arrange-hook.lua`** so every new app window auto-arranges, and hooks **`window-arrange --on-start`** into `~/.config/hypr/autostart.lua` so the grid also runs after autoload apps map.
 
 Why Super+J: default Omarchy `togglesplit` only flips already-tiled dwindle leaves. Floated / popped / maximized windows ignore it and keep stacking — the usual ultrawide / Surface Book mess. Arrange always re-packs the free work area as a responsive grid instead.
 
@@ -39,8 +40,10 @@ done
 #   o.bind("SUPER + J", "Arrange windows (grid)", "window-arrange")
 #   o.bind("SUPER + ALT + A", "Arrange windows", "window-arrange")
 #   o.bind("SUPER + B", "Arrange windows (edit)", "window-arrange --edit")
-# optional boot hook in ~/.config/hypr/autostart.lua:
+# optional boot + live open hooks in ~/.config/hypr/autostart.lua:
+#   require("hypr.window-arrange-hook")
 #   o.exec_on_start("window-arrange --on-start")
+# and copy window-arrange-hook.lua → ~/.config/hypr/window-arrange-hook.lua
 ```
 
 ## Performance
@@ -71,6 +74,7 @@ window-arrange --on-start   # wait for autostart apps, then arrange once
 | Arrange windows (alias) | **Super+Alt+A** | **Super+Option+A** |
 | Edit layout (drag/resize live) | **Super+B** | **Super+Option+B** |
 | Arrange after boot apps | autostart | `window-arrange --on-start` |
+| Arrange on every new window | auto (`window.open`) | `hypr.window-arrange-hook` |
 
 ### Interactive editor
 
@@ -94,10 +98,11 @@ Requires `gtk4` + `gtk4-layer-shell` + `python-gobject`. On Arch/Omarchy: `sudo 
 | `WINDOW_ARRANGE_PHONE_W` | adaptive | scrcpy strip width (logical px) |
 | `WINDOW_ARRANGE_PHONE_H` | adaptive | scrcpy strip height (logical px) |
 | `WINDOW_ARRANGE_ADAPT` | `1` | Set `0` to lock 12/16/360/800 defaults (still logical geometry) |
-| `WINDOW_ARRANGE_NOTIFY` | `1` (`0` under `--on-start`) | Set `0` to silence toast |
+| `WINDOW_ARRANGE_NOTIFY` | `1` (`0` under `--on-start` / auto-open) | Set `0` to silence toast |
 | `WINDOW_ARRANGE_ON_START_WAIT` | `8` | Seconds `--on-start` polls for mapped windows |
 | `WINDOW_ARRANGE_ON_START_MIN` | `2` | Min mapped windows before arranging |
 | `WINDOW_ARRANGE_ON_START_STABLE` | `2` | Consecutive identical snapshots required |
+| `WINDOW_ARRANGE_OPEN_DEBOUNCE_MS` | `80` | Coalesce burst `window.open` events before arrange |
 
 Example:
 

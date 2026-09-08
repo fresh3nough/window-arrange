@@ -17,16 +17,21 @@
 #   window-arrange --edit       # interactive drag-swap + edge/corner resize
 #   window-arrange --on-start   # wait for autostart apps, then arrange once
 #
+# Live auto-arrange (no CLI flag): install.sh drops
+#   ~/.config/hypr/window-arrange-hook.lua
+# which registers hl.on("window.open") and runs this script debounced.
+#
 # Env knobs (all optional; unset = adaptive from logical work area):
 #   WINDOW_ARRANGE_GAP=12
 #   WINDOW_ARRANGE_OUTER=16
 #   WINDOW_ARRANGE_PHONE_W=360
 #   WINDOW_ARRANGE_PHONE_H=800
 #   WINDOW_ARRANGE_ADAPT=1          # 0 = fixed defaults above, still logical geometry
-#   WINDOW_ARRANGE_NOTIFY=1         # 0 = silence toast (boot restore)
+#   WINDOW_ARRANGE_NOTIFY=1         # 0 = silence toast (boot / auto-open)
 #   WINDOW_ARRANGE_ON_START_WAIT=8  # seconds --on-start will poll for windows
 #   WINDOW_ARRANGE_ON_START_MIN=2   # min mapped windows before arranging
 #   WINDOW_ARRANGE_ON_START_STABLE=2  # consecutive stable polls required
+#   WINDOW_ARRANGE_OPEN_DEBOUNCE_MS=80  # Lua hook coalesces burst opens
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

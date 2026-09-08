@@ -23,6 +23,13 @@ for mod in layout.py geometry.py apply.py editor.py; do
 done
 install -m 0755 "${ROOT}/window-arrange" "${BIN_DIR}/window-arrange"
 
+# Lua hook: hl.on("window.open") → debounced window-arrange (Hyprland 0.56+).
+HOOK_SRC="${ROOT}/window-arrange-hook.lua"
+HOOK_DST="${HOME}/.config/hypr/window-arrange-hook.lua"
+mkdir -p "$(dirname "$HOOK_DST")"
+install -m 0644 "$HOOK_SRC" "$HOOK_DST"
+install -m 0644 "$HOOK_SRC" "${SHARE_DIR}/window-arrange-hook.lua"
+
 # Ensure ~/.local/bin is on PATH for this shell and future logins
 case ":${PATH}:" in
   *":${BIN_DIR}:"*) ;;
@@ -60,6 +67,7 @@ cat >> "$tmp" <<'LUA'
 -- CLI: window-arrange   |   dry-run: window-arrange --dry-run
 -- Edit: window-arrange --edit  (live drag-swap + edge/corner neighbor resize)
 -- Boot: window-arrange --on-start (waits for autostart apps, then arranges once)
+-- Auto: every new mapped window → debounced arrange (see window-arrange-hook.lua)
 hl.unbind("SUPER + J")
 o.bind("SUPER + J", "Arrange windows (grid)", "window-arrange")
 o.bind("SUPER + ALT + A", "Arrange windows", "window-arrange")
@@ -69,6 +77,7 @@ LUA
 mv "$tmp" "$BIND_FILE"
 
 # After Hyprland autostart apps map, run arrange once (quiet toast).
+# Also require the live window.open hook so every new app window rearranges.
 AUTOSTART_FILE="${HOME}/.config/hypr/autostart.lua"
 mkdir -p "$(dirname "$AUTOSTART_FILE")"
 if [ ! -f "$AUTOSTART_FILE" ]; then
@@ -88,8 +97,10 @@ awk '
 cat >> "$tmp" <<'LUA'
 
 -- window-arrange:begin
--- After autoload apps start, wait for a stable mapped set then arrange once.
--- WINDOW_ARRANGE_NOTIFY defaults to 0 in --on-start (no boot toast).
+-- Live: every new mapped app window → debounced arrange (quiet toast).
+-- Boot: after autoload apps start, wait for a stable mapped set then arrange once.
+-- WINDOW_ARRANGE_NOTIFY defaults to 0 on auto/on-start paths.
+require("hypr.window-arrange-hook")
 o.exec_on_start("window-arrange --on-start")
 -- window-arrange:end
 LUA
@@ -104,8 +115,10 @@ fi
 
 echo "Installed: ${BIN_DIR}/window-arrange"
 echo "Modules:   ${SHARE_DIR}/{layout,geometry,apply,editor}.py"
+echo "Hook:      ${HOOK_DST}  (hl.on window.open → arrange)"
 echo "Hotkeys:   Super+J / Super+Alt+A arrange · Super+B edit"
 echo "Autostart: window-arrange --on-start  (via ~/.config/hypr/autostart.lua)"
+echo "Auto:      every new app window rearranges instantly"
 echo "Run:       window-arrange"
 echo "Edit:      window-arrange --edit"
 echo "Dry-run:   window-arrange --dry-run"
