@@ -4,11 +4,11 @@
 Shared by the one-shot arranger and the interactive editor so both paths float,
 strip Omarchy tags, exit fullscreen, and lock cells the same way.
 
-Toolkit min-size clamps (Chromium ~500w, Goose ~480x400) silently refuse a
-smaller resize; Hyprland's resize is center-anchored, so the top-left drifts
-into the neighbor. Omarchy also tags 1Password / Bitwarden / dialogs with
-`floating-window`, which forces `float + center + size {875, 600}` via
-`/usr/share/omarchy/default/hypr/apps/system.lua`. Bare
+Toolkit min-size clamps (Chromium ~500w, Goose ~480x400, 1Password ~784w)
+silently refuse a smaller resize; Hyprland's resize is center-anchored, so the
+top-left drifts into the neighbor. Omarchy also tags 1Password / Bitwarden /
+dialogs with `floating-window`, which forces `float + center + size {875, 600}`
+via `/usr/share/omarchy/default/hypr/apps/system.lua`. Bare
 `hl.dsp.window.float({})` **toggles** float, so a second arrange (or a stale
 floating bit) tiles the window and the next resize balloons to the monitor.
 
@@ -20,7 +20,8 @@ We:
 3. resize → move → resize → move (rules can reflow after float).
 4. Final settle pass: enable-float + strip + resize/move again after the
    client has applied its configure, so clamps / tag size rules cannot leave
-   overlaps.
+   overlaps. Move-only pins for oversize clamps keep the live frame inside the
+   planned work-area bounds (never cut off the right/bottom edge).
 """
 
 from __future__ import annotations
@@ -44,6 +45,55 @@ def fs_mode(value: Any) -> int:
         return int(value)
     except Exception:
         return 1 if value else 0
+
+
+def work_bounds_from_plan(plan: list[dict[str, Any]]) -> tuple[int, int, int, int]:
+    """Union of planned cells expanded by any per-item bound_* meta.
+
+    Used when a client clamps larger than its cell so the pin stays on-screen
+    instead of locking the planned top-left and spilling past the monitor.
+    """
+    if not plan:
+        return 0, 0, 0, 0
+    xs: list[int] = []
+    ys: list[int] = []
+    x1s: list[int] = []
+    y1s: list[int] = []
+    for p in plan:
+        meta = p.get("meta") or {}
+        if "bound_x0" in meta and "bound_y0" in meta and "bound_x1" in meta and "bound_y1" in meta:
+            xs.append(int(meta["bound_x0"]))
+            ys.append(int(meta["bound_y0"]))
+            x1s.append(int(meta["bound_x1"]))
+            y1s.append(int(meta["bound_y1"]))
+        xs.append(int(p["x"]))
+        ys.append(int(p["y"]))
+        x1s.append(int(p["x"]) + int(p["w"]))
+        y1s.append(int(p["y"]) + int(p["h"]))
+    return min(xs), min(ys), max(x1s), max(y1s)
+
+
+def pin_xy_for_live_size(
+    px: int,
+    py: int,
+    live_w: int,
+    live_h: int,
+    bounds: tuple[int, int, int, int],
+) -> tuple[int, int]:
+    """Prefer planned top-left; shift up/left so live size stays inside bounds."""
+    bx0, by0, bx1, by1 = bounds
+    x, y = int(px), int(py)
+    lw = max(0, int(live_w))
+    lh = max(0, int(live_h))
+    if lw > 0 and x + lw > bx1:
+        x = max(bx0, bx1 - lw)
+    if lh > 0 and y + lh > by1:
+        y = max(by0, by1 - lh)
+    if x < bx0:
+        x = bx0
+    if y < by0:
+        y = by0
+    return x, y
 
 
 def build_apply_lua(
@@ -204,7 +254,8 @@ def apply_plan(
     if settle_retry:
         # Yield so Wayland clients finish configure. A clamping resize in the
         # same hyprctl eval as move (1Password ~784w) leaves top-left drifted;
-        # a later move-only eval pins it. Omarchy may also re-tag floating-window.
+        # a later move-only eval pins it inside work bounds. Omarchy may also
+        # re-tag floating-window.
         time.sleep(0.05)
         try:
             live_list = load_json(["hyprctl", "clients", "-j"])
@@ -212,8 +263,17 @@ def apply_plan(
         except Exception:
             live = {}
 
+        bounds = work_bounds_from_plan(plan)
         place_fixes: list[str] = []
-        move_fixes: list[str] = []
+        # addr -> pin lua line (dedupe; last wins after re-read)
+        move_pins: dict[str, str] = {}
+
+        def queue_pin(addr: str, px: int, py: int, live_w: int, live_h: int) -> None:
+            sx, sy = pin_xy_for_live_size(px, py, live_w, live_h, bounds)
+            move_pins[addr] = (
+                "pin(%s, %d, %d)" % (lua_str(f"address:{addr}"), sx, sy)
+            )
+
         for p in plan:
             addr = p["address"]
             c = live.get(addr)
@@ -226,26 +286,25 @@ def apply_plan(
             tagged_float = any(
                 str(t).rstrip("*") == "floating-window" for t in tags
             )
-            pos_bad = at[0] != px or at[1] != py
-            size_small = size[0] < pw or size[1] < ph
-            size_mismatch = size[0] != pw or size[1] != ph
+            lw, lh = int(size[0]), int(size[1])
+            # Desired pin (planned TL, shifted if live size would leave bounds).
+            want_x, want_y = pin_xy_for_live_size(px, py, lw, lh, bounds)
+            pos_bad = at[0] != want_x or at[1] != want_y
+            size_small = lw < pw or lh < ph
+            size_mismatch = lw != pw or lh != ph
             if not (pos_bad or size_mismatch or tagged_float):
                 continue
             # If the client clamped larger than the cell, only move — a
             # same-eval resize back to the cell width re-drifts top-left.
-            if (size[0] > pw or size[1] > ph) and not tagged_float:
-                move_fixes.append(
-                    "pin(%s, %d, %d)" % (lua_str(f"address:{addr}"), px, py)
-                )
+            if (lw > pw or lh > ph) and not tagged_float:
+                queue_pin(addr, px, py, lw, lh)
             elif size_small or tagged_float:
                 place_fixes.append(
                     "settle(%s, %d, %d, %d, %d)"
                     % (lua_str(f"address:{addr}"), px, py, pw, ph)
                 )
             elif pos_bad:
-                move_fixes.append(
-                    "pin(%s, %d, %d)" % (lua_str(f"address:{addr}"), px, py)
-                )
+                queue_pin(addr, px, py, lw, lh)
 
         settled = 0
         if place_fixes:
@@ -289,14 +348,17 @@ def apply_plan(
                 if not c:
                     continue
                 at = c.get("at") or [0, 0]
+                size = c.get("size") or [0, 0]
                 px, py = int(p["x"]), int(p["y"])
-                if at[0] != px or at[1] != py:
-                    pin = "pin(%s, %d, %d)" % (lua_str(f"address:{addr}"), px, py)
-                    if pin not in move_fixes:
-                        move_fixes.append(pin)
+                lw, lh = int(size[0]), int(size[1])
+                want_x, want_y = pin_xy_for_live_size(px, py, lw, lh, bounds)
+                if at[0] != want_x or at[1] != want_y:
+                    queue_pin(addr, px, py, lw, lh)
 
-        if move_fixes:
-            # Separate eval from any resize: move-only pins clamped clients.
+        if move_pins:
+            # Separate eval from any resize: move-only pins clamped clients
+            # inside work bounds so 1Password cannot spill past the monitor.
+            move_fixes = list(move_pins.values())
             pin_lua = (
                 "local function pin(w, x, y)\n"
                 "  pcall(function() hl.dispatch(hl.dsp.window.float({ window = w, action = 'enable' })) end)\n"

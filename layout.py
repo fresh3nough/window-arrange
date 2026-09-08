@@ -332,6 +332,123 @@ def split_axis_weighted(
     return out
 
 
+def split_axis_with_floors(
+    total: int, floors: list[int], gap: int, weights: list[int] | None = None
+) -> list[tuple[int, int]]:
+    """Partition `total` honoring absolute min sizes, then weight the remainder.
+
+    Toolkit clamps need absolute px (Goose/1Password ~400h), not only relative
+    weight — a 5-stack weighted split otherwise gives Goose ~300 of 854 usable.
+    When floors sum above usable, scale them down proportionally (best effort).
+    """
+    n = len(floors)
+    if n <= 0:
+        return []
+    if n == 1:
+        return [(0, max(1, total))]
+    gap = max(0, gap)
+    usable = total - gap * (n - 1)
+    if usable < n:
+        usable = n
+    mins = [max(1, int(f)) for f in floors]
+    need = sum(mins)
+    if need > usable:
+        # Protect large floors (tall toolkit mins ~400) first; shrink flexible
+        # donors down to a hard 80px before touching a tall floor. Only if still
+        # over budget do we scale the protected floors.
+        hard_flex = 80
+        protected = [i for i, m in enumerate(mins) if m >= 350]
+        flex = [i for i in range(n) if i not in protected]
+        sizes = list(mins)
+        # Collapse flexible first.
+        for i in flex:
+            sizes[i] = hard_flex
+        over = sum(sizes) - usable
+        if over > 0 and flex:
+            # Already at hard_flex; need to cut protected.
+            pass
+        elif over < 0:
+            # Give remainder back by weight among all.
+            rem = -over
+            wts = [max(1, int(w)) for w in (weights if weights is not None else floors)]
+            wsum = sum(wts) or 1
+            for i in range(n):
+                add = int(rem * wts[i] / wsum)
+                sizes[i] += add
+            drift = usable - sum(sizes)
+            i = 0
+            while drift != 0 and n > 0:
+                if drift > 0:
+                    sizes[i % n] += 1
+                    drift -= 1
+                else:
+                    floor_i = hard_flex if i % n in flex else (350 if i % n in protected else 1)
+                    if sizes[i % n] > floor_i:
+                        sizes[i % n] -= 1
+                        drift += 1
+                i += 1
+                if i > n * (abs(drift) + 2):
+                    break
+        if sum(sizes) > usable:
+            # Still over: scale everything, but bias cut toward flex.
+            over = sum(sizes) - usable
+            for i in flex:
+                if over <= 0:
+                    break
+                cut = min(over, max(0, sizes[i] - hard_flex))
+                sizes[i] -= cut
+                over -= cut
+            if over > 0:
+                for i in protected:
+                    if over <= 0:
+                        break
+                    cut = min(over, max(0, sizes[i] - hard_flex))
+                    sizes[i] -= cut
+                    over -= cut
+            if over > 0:
+                scale = usable / max(sum(sizes), 1)
+                sizes = [max(1, int(s * scale)) for s in sizes]
+            drift = usable - sum(sizes)
+            i = 0
+            while drift != 0 and n > 0:
+                if drift > 0:
+                    sizes[i % n] += 1
+                    drift -= 1
+                else:
+                    if sizes[i % n] > 1:
+                        sizes[i % n] -= 1
+                        drift += 1
+                i += 1
+                if i > n * (abs(drift) + 2):
+                    break
+    else:
+        rem = usable - need
+        wts = [max(1, int(w)) for w in (weights if weights is not None else floors)]
+        wsum = sum(wts)
+        extra = [int(rem * w / wsum) for w in wts]
+        sizes = [mins[i] + extra[i] for i in range(n)]
+        drift = usable - sum(sizes)
+        i = 0
+        while drift != 0 and n > 0:
+            if drift > 0:
+                sizes[i % n] += 1
+                drift -= 1
+            else:
+                # Never shrink below floor.
+                if sizes[i % n] > mins[i]:
+                    sizes[i % n] -= 1
+                    drift += 1
+            i += 1
+            if i > n * (abs(drift) + 2):
+                break
+    out: list[tuple[int, int]] = []
+    pos = 0
+    for size in sizes:
+        out.append((pos, size))
+        pos += size + gap
+    return out
+
+
 def _stack_column_counts(n: int, n_cols: int) -> list[int]:
     """How many windows per stack column (left → right), summing to n."""
     if n <= 0 or n_cols <= 0:
@@ -368,26 +485,30 @@ def place_column_stacks(
 ) -> list[tuple[int, int, int, int]]:
     """Multi-column stack layout when a uniform grid would crush toolkit mins.
 
-    Example n=5 → 3+2 two-col stacks. n=7 on a wide canvas → 3+2+2 three-col
-    so tall apps (~400h) still fit; two-col 4+3 would leave ~240px rows.
+    Example n=5 → 3+2 two-col stacks. n=7 → prefer 3+2+2 three-col so two
+    tall apps (~400h) can each sit in a 2-row stack; two-col 4+3 puts both
+    tall apps in a 3-row band (~300h) and their clamps overlap.
     Optional per-column height_weights grow tall-min apps inside a stack.
     Cells are returned column-major (left→right, top→bottom within each).
     """
     if n <= 0:
         return []
-    # As many columns as width allows at min_col_w, capped so each stack has
-    # enough height for a tall min (~400) when possible.
-    max_by_w = max(1, (grid_w + gap) // (max(min_col_w, 1) + gap))
-    # Rows needed if we use k columns ≈ ceil(n/k); want row height ≥ 400.
     prefer_rh = 400
+    # Soft floor lets 7-up take 3 columns on ~1440 logical (~460w) when two
+    # columns would crush row height below tall toolkit mins.
+    soft_col_w = max(360, min(int(min_col_w), 460))
+    max_by_hard = max(1, (grid_w + gap) // (max(min_col_w, 1) + gap))
+    max_by_soft = max(1, (grid_w + gap) // (soft_col_w + gap))
+    max_by_w = max(max_by_hard, max_by_soft if n >= 7 else max_by_hard)
     best_cols = 2 if n >= 2 else 1
     for k in range(1, min(n, max_by_w) + 1):
         rows_k = math.ceil(n / k)
         rh = (grid_h - gap * (rows_k - 1)) / max(rows_k, 1)
         cw = (grid_w - gap * (k - 1)) / k
-        if cw < min_col_w * 0.9:
+        floor = min_col_w * 0.9 if k <= max_by_hard else soft_col_w * 0.9
+        if cw < floor:
             continue
-        # Prefer the smallest k that keeps rh above prefer_rh; otherwise max k.
+        # Prefer the smallest k that keeps densest stack rows above prefer_rh.
         if rh >= prefer_rh:
             best_cols = k
             break
@@ -395,6 +516,10 @@ def place_column_stacks(
     # n=5 always two-col 3+2 (classic).
     if n == 5:
         best_cols = 2
+    # n=7/8: force 3-col 3+2+2 / 3+3+2 when width clears soft floor so two
+    # tall apps land in 2-row stacks (~445h) instead of sharing a 3-row band.
+    if n in (7, 8) and grid_w >= soft_col_w * 3 + gap * 2:
+        best_cols = max(best_cols, 3)
     counts = _stack_column_counts(n, best_cols)
     col_bands = split_axis(grid_w, len(counts), gap)
     cells: list[tuple[int, int, int, int]] = []
@@ -451,20 +576,20 @@ def place_grid(
         return place_column_stacks(
             n, grid_x0, grid_y0, grid_w, grid_h, gap, min_col_w=prefer_cw
         )
-    # Secondary: height-crushed multi-row with soft width miss.
+    # Secondary: height-crushed multi-row. Prefer stacks whenever average row
+    # height drops under tall toolkit mins (~400), even if cell width is fine
+    # (7-up on ~1440 logical is 2×4 at ~216h — Goose/1Password clamp hard).
     soft_cw = max(160, min(prefer_cw, 460))
     if (
         can_stack
         and n >= 5
-        and densest_cw < soft_cw
-        and densest_rh < prefer_rh
-        and not (n % 2 == 0 and rows == 2 and densest_cw >= soft_cw)
+        and densest_rh + 0.5 < prefer_rh
+        and not (n % 2 == 0 and rows == 2 and densest_cw >= soft_cw and densest_rh >= prefer_rh * 0.85)
     ):
         return place_column_stacks(
             n, grid_x0, grid_y0, grid_w, grid_h, gap, min_col_w=prefer_cw
         )
-    # Tertiary: 7+ windows where a uniform grid keeps width but crushes height
-    # below tall toolkit mins — prefer multi-col stacks sized to prefer_cw.
+    # Tertiary: 7+ on wide canvases that can host 3 stack columns.
     if (
         can_stack
         and n >= 7
@@ -501,14 +626,28 @@ def assign_windows_to_cells(
     windows: list[dict[str, Any]],
     cells: list[tuple[int, int, int, int]],
 ) -> list[tuple[dict[str, Any], tuple[int, int, int, int]]]:
-    """Match windows to cells: min-size-heavy apps get the tallest+widest cells first."""
+    """Match windows to cells: min-size-heavy apps get the best cells first.
+
+    Preference order for a demanding app:
+      1. taller cell height (fits ~400h clamps)
+      2. fewer siblings in the same column stack (2-row beats 3-row when both
+         are ~tall — avoids seating two Goose/1Password clamps in one 3-stack)
+      3. wider cell width (fits ~784w / Chromium ~500)
+    """
     if not windows or not cells:
         return []
-    cell_order = sorted(
-        range(len(cells)),
-        key=lambda i: (cells[i][3], cells[i][2], cells[i][2] * cells[i][3]),
-        reverse=True,
-    )
+    # How many cells share each column band (same x+w).
+    stack_size: list[int] = [1] * len(cells)
+    for idxs in _group_cells_by_column(cells):
+        for i in idxs:
+            stack_size[i] = len(idxs)
+
+    def cell_key(i: int) -> tuple:
+        x, y, w, h = cells[i]
+        # Sort descending via negatives where needed in reverse=True below.
+        return (h, -stack_size[i], w, w * h)
+
+    cell_order = sorted(range(len(cells)), key=cell_key, reverse=True)
     win_order = sorted(
         range(len(windows)),
         key=lambda i: (
@@ -519,13 +658,36 @@ def assign_windows_to_cells(
     )
     pairs: list[tuple[dict[str, Any], tuple[int, int, int, int]] | None] = [None] * len(windows)
     used_cells: set[int] = set()
+    # Track how many tall apps already took a seat in each column band so a
+    # second 400h clamp prefers a different stack.
+    tall_seated: dict[tuple[int, int], int] = {}
     for wi in win_order:
+        win = windows[wi]
+        need_tall = wants_tall(win)
+        chosen = None
         for ci in cell_order:
             if ci in used_cells:
                 continue
-            pairs[wi] = (windows[wi], cells[ci])
-            used_cells.add(ci)
+            x, _y, w, _h = cells[ci]
+            band = (x, w)
+            if need_tall and tall_seated.get(band, 0) >= 1 and stack_size[ci] >= 3:
+                # Leave room: another tall already owns this deep stack.
+                continue
+            chosen = ci
             break
+        if chosen is None:
+            for ci in cell_order:
+                if ci not in used_cells:
+                    chosen = ci
+                    break
+        if chosen is None:
+            continue
+        pairs[wi] = (win, cells[chosen])
+        used_cells.add(chosen)
+        if need_tall:
+            x, _y, w, _h = cells[chosen]
+            band = (x, w)
+            tall_seated[band] = tall_seated.get(band, 0) + 1
     out: list[tuple[dict[str, Any], tuple[int, int, int, int]]] = []
     for i, p in enumerate(pairs):
         if p is None:
@@ -562,56 +724,168 @@ def _group_cells_by_column(
     return cols
 
 
+def _group_cells_by_row(
+    cells: list[tuple[int, int, int, int]],
+) -> list[list[int]]:
+    """Indices of cells that share a row band (same y and height), left→right."""
+    if not cells:
+        return []
+    by_band: dict[tuple[int, int], list[int]] = {}
+    for i, (_x, y, _w, h) in enumerate(cells):
+        by_band.setdefault((y, h), []).append(i)
+    rows: list[list[int]] = []
+    for key in sorted(by_band):
+        idxs = by_band[key]
+        idxs.sort(key=lambda i: cells[i][0])
+        rows.append(idxs)
+    return rows
+
+
+def _height_weight_for(win: dict[str, Any]) -> int:
+    """Vertical split weight so tall toolkit mins keep usable donors."""
+    _mw, mh = toolkit_min_size(win)
+    base = max(mh, 160)
+    if wants_tall(win):
+        base = max(base, 400)
+    if wants_wide(win) and not wants_tall(win):
+        base = max(base, 220)
+    return base
+
+
+def _width_weight_for(win: dict[str, Any]) -> int:
+    """Horizontal split weight so wide clamps (1Password ~784) keep a column."""
+    mw, _mh = toolkit_min_size(win)
+    base = max(mw, 200)
+    if wants_wide(win):
+        base = max(base, mw, 500)
+    return base
+
+
+def _columns_span_full_height(
+    col_groups: list[list[int]],
+    cells: list[tuple[int, int, int, int]],
+    grid_y0: int,
+    grid_h: int,
+    tol: int = 3,
+) -> bool:
+    """True when every column band covers the full grid height (stack layout)."""
+    if not col_groups or grid_h <= 0:
+        return False
+    bottom = grid_y0 + grid_h
+    for idxs in col_groups:
+        top = min(cells[i][1] for i in idxs)
+        bot = max(cells[i][1] + cells[i][3] for i in idxs)
+        if abs(top - grid_y0) > tol or abs(bot - bottom) > tol:
+            return False
+    return True
+
+
 def fit_pairs_to_toolkit_mins(
     pairs: list[tuple[dict[str, Any], tuple[int, int, int, int]]],
     gap: int,
+    grid_x0: int | None = None,
+    grid_y0: int | None = None,
+    grid_w: int | None = None,
+    grid_h: int | None = None,
 ) -> list[tuple[dict[str, Any], tuple[int, int, int, int]]]:
-    """Re-flow heights inside each column band so toolkit min-heights fit.
+    """Re-flow cell sizes so toolkit min widths/heights fit without overlap.
 
-    Only cells that share the same x and width are reflowed together (true
-    stacks). When a band has three equal ~292px rows, Goose/1Password's 400px
-    clamp overflows; this boosts tall cells and shrinks flexible ones
-    (terminals) so the band still packs exactly with gutters and no overlap.
+    1. Height: true vertical stacks (same x+w) share a weighted split so
+       Goose/1Password ~400h does not overflow a 3-up column.
+    2. Width: full-height stack columns get a weighted horizontal split so
+       1Password's ~784w clamp is planned into the column (equal half-width
+       columns of ~698 on HiDPI were pinning top-left and cutting off the
+       right edge). Non-stack row grids reflow each row band the same way.
     """
     if not pairs:
         return []
     cells = [cell for _w, cell in pairs]
-    col_groups = _group_cells_by_column(cells)
-    # Work on a mutable copy of cell geometry.
     new_cells: list[tuple[int, int, int, int]] = [c for c in cells]
 
+    # Infer grid box from cells when caller omits it (tests / older callers).
+    if grid_x0 is None:
+        grid_x0 = min(c[0] for c in new_cells)
+    if grid_y0 is None:
+        grid_y0 = min(c[1] for c in new_cells)
+    if grid_w is None:
+        grid_w = max(c[0] + c[2] for c in new_cells) - grid_x0
+    if grid_h is None:
+        grid_h = max(c[1] + c[3] for c in new_cells) - grid_y0
+
+    col_groups = _group_cells_by_column(new_cells)
+
+    # --- vertical reflow inside each column stack ---
     for idxs in col_groups:
         if len(idxs) <= 1:
-            # Single cell: keep planned geometry (clamp handled at apply time).
             continue
-
-        # Column vertical span from current cells.
         top = min(new_cells[i][1] for i in idxs)
         bottom = max(new_cells[i][1] + new_cells[i][3] for i in idxs)
         total_h = bottom - top
         x = new_cells[idxs[0]][0]
         w = new_cells[idxs[0]][2]
-
-        weights: list[int] = []
+        floors = []
+        weights = []
         for i in idxs:
-            wwin = pairs[i][0]
-            _mw, mh = toolkit_min_size(wwin)
-            # Weight by min height; flexible apps keep a modest floor so they
-            # still remain usable after donors give space to Goose/1Password.
-            base = max(mh, 160)
-            if wants_tall(wwin):
-                base = max(base, 400)
-            if wants_wide(wwin) and not wants_tall(wwin):
-                base = max(base, 220)
-            weights.append(base)
-
-        # Prefer honoring weights; split_axis_weighted always fills total_h.
-        bands = split_axis_weighted(total_h, weights, gap)
+            win = pairs[i][0]
+            _mw, mh = toolkit_min_size(win)
+            # Absolute floor so Goose/1Password keep ~400h when the column can.
+            fl = max(mh if wants_tall(win) else min(mh, 200), 120)
+            floors.append(fl)
+            weights.append(_height_weight_for(win))
+        bands = split_axis_with_floors(total_h, floors, gap, weights)
         for band_i, cell_i in enumerate(idxs):
             ry, rh = bands[band_i]
             new_cells[cell_i] = (x, top + ry, w, rh)
 
+    # --- horizontal reflow ---
+    col_groups = _group_cells_by_column(new_cells)
+    if (
+        len(col_groups) >= 2
+        and _columns_span_full_height(col_groups, new_cells, grid_y0, grid_h)
+    ):
+        # Stack layout: one width per column, weighted by the hungriest app.
+        weights = [
+            max(_width_weight_for(pairs[i][0]) for i in idxs) for idxs in col_groups
+        ]
+        bands = split_axis_weighted(grid_w, weights, gap)
+        for col_i, idxs in enumerate(col_groups):
+            cx, cw = bands[col_i]
+            nx = grid_x0 + cx
+            for cell_i in idxs:
+                _x, y, _w, h = new_cells[cell_i]
+                new_cells[cell_i] = (nx, y, cw, h)
+    else:
+        # Row grid (2+3 etc.): weight widths inside each shared y-band.
+        for idxs in _group_cells_by_row(new_cells):
+            if len(idxs) <= 1:
+                continue
+            left = min(new_cells[i][0] for i in idxs)
+            right = max(new_cells[i][0] + new_cells[i][2] for i in idxs)
+            total_w = right - left
+            weights = [_width_weight_for(pairs[i][0]) for i in idxs]
+            bands = split_axis_weighted(total_w, weights, gap)
+            y = new_cells[idxs[0]][1]
+            h = new_cells[idxs[0]][3]
+            for band_i, cell_i in enumerate(idxs):
+                cx, cw = bands[band_i]
+                new_cells[cell_i] = (left + cx, y, cw, h)
+
     return [(pairs[i][0], new_cells[i]) for i in range(len(pairs))]
+
+
+def _oversized_width_clamps(
+    windows: list[dict[str, Any]],
+    grid_w: int,
+    gap: int,
+) -> list[dict[str, Any]]:
+    """Windows whose min width cannot fit in a half-grid column (1Password ~784)."""
+    half = (grid_w - gap) // 2 if grid_w > gap else grid_w
+    out: list[dict[str, Any]] = []
+    for w in windows:
+        mw, _mh = toolkit_min_size(w)
+        if mw > half:
+            out.append(w)
+    return out
 
 
 def pack_window_cells(
@@ -622,18 +896,127 @@ def pack_window_cells(
     grid_h: int,
     gap: int,
 ) -> list[tuple[dict[str, Any], tuple[int, int, int, int]]]:
-    """Plan non-overlapping cells sized for the windows' toolkit mins."""
+    """Plan non-overlapping cells sized for the windows' toolkit mins.
+
+    When one app (1Password ~784w) exceeds half the grid, reserve a full-height
+    strip of that width on the right and pack the rest into the leftover
+    region. Equal half-width stacks cannot honor the clamp without cutting the
+    right edge off-screen; a dedicated strip + leftover pack keeps every frame
+    on-monitor and non-overlapping for 5–7 apps.
+    """
     n = len(windows)
     if n <= 0:
         return []
-    # Demand the max observed min-width among this set so Chromium forces stacks.
+
+    half = (grid_w - gap) // 2 if grid_w > gap else 500
+    oversize = _oversized_width_clamps(windows, grid_w, gap)
+
+    # Dedicated strip path: exactly one oversize clamp and enough leftover for
+    # the remaining windows (need ≥360px so Chromium/foot stay usable).
+    if len(oversize) == 1 and n >= 2:
+        big = oversize[0]
+        mw, mh = toolkit_min_size(big)
+        # Cap strip so leftover stays useful; never exceed the grid.
+        strip_w = min(max(mw, 1), grid_w)
+        leftover_w = grid_w - strip_w - gap
+        min_left = 360 if n >= 3 else 280
+        if leftover_w >= min_left and strip_w + gap + leftover_w <= grid_w:
+            rest = [w for w in windows if w is not big]
+            # Prefer putting the wide strip on the right (matches phone strip).
+            left_x0 = grid_x0
+            strip_x0 = grid_x0 + leftover_w + gap
+
+            # When leftover would crush many windows AND the strip can host two
+            # ≥400h rows, seat a second tall app (Goose/code) in the strip.
+            strip_wins: list[dict[str, Any]] = [big]
+            prefer_rh = 400
+            two_row_h = (grid_h - gap) // 2
+            if (
+                len(rest) >= 5
+                and two_row_h >= prefer_rh
+                and mh <= two_row_h + 20
+            ):
+                partners = sorted(
+                    [w for w in rest if wants_tall(w)],
+                    key=lambda w: toolkit_min_size(w)[1],
+                    reverse=True,
+                )
+                if partners:
+                    partner = partners[0]
+                    rest = [w for w in rest if w is not partner]
+                    strip_wins.append(partner)
+
+            # Leftover next to a 784 strip is often ~600w — too narrow for two
+            # Chromium-safe columns. Force a single full-width stack so every
+            # rest cell is leftover_w wide (clamps cannot spill into the strip).
+            rest_cells: list[tuple[int, int, int, int]] = []
+            if rest:
+                rest_demand = max(
+                    (toolkit_min_size(w)[0] for w in rest), default=500
+                )
+                can_two = leftover_w >= rest_demand * 2 + gap
+                if can_two:
+                    rest_prefer = min_cell_width_for(leftover_w, gap)
+                    rest_cells = place_grid(
+                        len(rest),
+                        left_x0,
+                        grid_y0,
+                        leftover_w,
+                        grid_h,
+                        gap,
+                        min_cell_w=rest_prefer,
+                    )
+                else:
+                    # One column, weighted heights for tall rest apps.
+                    weights = [_height_weight_for(w) for w in rest]
+                    # Sort rest so tall apps get weight via assign after equal
+                    # bands; fit_pairs will reweight. Use equal bands first.
+                    bands = split_axis(grid_h, len(rest), gap)
+                    rest_cells = [
+                        (left_x0, grid_y0 + ry, leftover_w, rh)
+                        for ry, rh in bands
+                    ]
+            rest_pairs = (
+                assign_windows_to_cells(rest, rest_cells) if rest else []
+            )
+            if rest_pairs:
+                rest_pairs = fit_pairs_to_toolkit_mins(
+                    rest_pairs,
+                    gap,
+                    grid_x0=left_x0,
+                    grid_y0=grid_y0,
+                    grid_w=leftover_w,
+                    grid_h=grid_h,
+                )
+
+            # Strip cells: full-height solo, or floor-aware 2-row stack.
+            if len(strip_wins) == 1:
+                strip_pairs = [
+                    (strip_wins[0], (strip_x0, grid_y0, strip_w, grid_h))
+                ]
+            else:
+                floors = [toolkit_min_size(w)[1] for w in strip_wins]
+                weights = [_height_weight_for(w) for w in strip_wins]
+                bands = split_axis_with_floors(grid_h, floors, gap, weights)
+                strip_pairs = [
+                    (w, (strip_x0, grid_y0 + ry, strip_w, rh))
+                    for w, (ry, rh) in zip(strip_wins, bands)
+                ]
+            return list(rest_pairs) + strip_pairs
+
+    # Standard path: stack/grid + height/width weight reflow.
     demand_w = max((toolkit_min_size(w)[0] for w in windows), default=500)
-    prefer_cw = max(min_cell_width_for(grid_w, gap), min(demand_w, (grid_w - gap) // 2 if grid_w > gap else demand_w))
+    prefer_cw = max(
+        min_cell_width_for(grid_w, gap),
+        min(demand_w, half) if demand_w <= half else half,
+    )
     cells = place_grid(
         n, grid_x0, grid_y0, grid_w, grid_h, gap, min_cell_w=prefer_cw
     )
     pairs = assign_windows_to_cells(windows, cells)
-    return fit_pairs_to_toolkit_mins(pairs, gap)
+    return fit_pairs_to_toolkit_mins(
+        pairs, gap, grid_x0=grid_x0, grid_y0=grid_y0, grid_w=grid_w, grid_h=grid_h
+    )
 
 
 def build_plan(
@@ -721,6 +1104,11 @@ def build_plan(
                     "gap": gap_i,
                     "outer": outer_i,
                     "logical": list(logical_monitor_box(mon)[2:4]),
+                    # Work-area bounds for settle pins of oversize clamps.
+                    "bound_x0": int(x0),
+                    "bound_y0": int(y0),
+                    "bound_x1": int(x1),
+                    "bound_y1": int(y1),
                 },
             }
         )
@@ -763,6 +1151,10 @@ def build_plan(
                         "rows": rows,
                         "logical": list(logical_monitor_box(mon)[2:4]),
                         "toolkit_min": [int(mw), int(mh)],
+                        "bound_x0": int(x0),
+                        "bound_y0": int(y0),
+                        "bound_x1": int(x1),
+                        "bound_y1": int(y1),
                     },
                 }
             )
