@@ -80,7 +80,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("PangoCairo", "1.0")
 gi.require_version("Gtk4LayerShell", "1.0")
-from gi.repository import Gdk, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
+from gi.repository import Gdk, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
 
 
@@ -760,25 +760,29 @@ class ArrangeCanvas(Gtk.DrawingArea):
         cr.close_path()
 
 
-class EditorApp(Gtk.Application):
+class EditorApp:
+    """Plain Gtk.Window overlay (single instance handled by PID, not DBus).
+
+    We deliberately do NOT use Gtk.Application here: its DBus name registration
+    (org.omarchy.windowarrange.editor) is what made Super+B flaky — the window
+    only maps once the app acquires/claims the bus name, and on a first press it
+    could spin or exit before do_activate fired, so the next press (or a DBus
+    REPLACE takeover) was the one that actually worked. A plain Gtk.Window
+    presents synchronously and deterministically. Single-instancing is enforced
+    by the bash launcher's flock + `_claim_single_instance()` killing prior
+    editor.py processes.
+    """
+
     def __init__(self, windows: list[dict[str, Any]], mon: dict[str, Any], gap: int):
-        # ALLOW_REPLACEMENT + REPLACE: a second Super+B takes over the bus name
-        # instead of stacking another CPU-heavy overlay.
-        super().__init__(
-            application_id="org.omarchy.windowarrange.editor",
-            flags=Gio.ApplicationFlags.ALLOW_REPLACEMENT | Gio.ApplicationFlags.REPLACE,
-        )
         self._windows = windows
         self._mon = mon
         self._gap = gap
         self._exit_code = 0
         self._canvas: ArrangeCanvas | None = None
-        try:
-            self.register()
-        except Exception:
-            pass
+        self._window: Gtk.Window | None = None
+        self._loop = GLib.MainLoop()
 
-    def do_activate(self) -> None:  # noqa: N802 — GObject override
+    def _show(self) -> None:
         mx, my, lw, lh, _scale = logical_monitor_box(self._mon)
         outer = _outer_from_env()
         if outer is None:
@@ -786,7 +790,9 @@ class EditorApp(Gtk.Application):
         x0, y0, x1, y1, _aw, _ah = work_area(self._mon, outer)
         bounds = (x0, y0, x1, y1)
 
-        win = Gtk.ApplicationWindow(application=self)
+        win = Gtk.Window()
+        self._window = win
+        win.set_application(None)
         win.set_default_size(lw, lh)
         win.set_title("window-arrange editor")
         # Ask GTK for a transparent background (no white flash on map).
@@ -839,7 +845,8 @@ class EditorApp(Gtk.Application):
             else:
                 print(f"applied={result.get('count', len(windows))} ms={result.get('ms', 0):.0f}")
                 self._exit_code = 0
-            win.close()
+            self._loop.quit()
+            win.destroy()
 
         def do_cancel() -> None:
             # Restore geometries from editor open.
@@ -849,7 +856,8 @@ class EditorApp(Gtk.Application):
                     print(f"restore_error={result['error']}", file=sys.stderr)
             print("cancelled")
             self._exit_code = 0
-            win.close()
+            self._loop.quit()
+            win.destroy()
 
         canvas = ArrangeCanvas(
             windows=self._windows,
@@ -894,8 +902,8 @@ class EditorApp(Gtk.Application):
 
                 def _smoke_quit() -> bool:
                     print("smoke_cancel")
-                    win.close()
-                    self.quit()
+                    self._loop.quit()
+                    win.destroy()
                     return False
 
                 GLib.timeout_add(ms, _smoke_quit)
@@ -946,7 +954,8 @@ def run_editor(
         return 0
     gap_i = int(gap if gap is not None else _gap_from_env_or_meta(windows))
     app = EditorApp(windows, mon, gap_i)
-    app.run(None)
+    app._show()
+    app._loop.run()
     return int(getattr(app, "_exit_code", 0))
 
 
