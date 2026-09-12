@@ -88,7 +88,28 @@ for arg in "$@"; do
 done
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
-need hyprctl
+
+# Pixel Omarchy uses nested Sway instead of Hyprland. Keep the full adaptive
+# planner for Hyprland, but provide a safe native Sway layout rather than
+# failing at startup when hyprctl is unavailable.
+if ! command -v hyprctl >/dev/null 2>&1; then
+  if command -v swaymsg >/dev/null 2>&1 && [[ -n ${SWAYSOCK:-} ]]; then
+    workspace="$(swaymsg -t get_workspaces -r | python3 -c '
+import json, sys
+for workspace in json.load(sys.stdin):
+    if workspace.get("focused"):
+        print(workspace.get("name", "1"))
+        break
+' 2>/dev/null || true)"
+    [[ -n $workspace ]] || workspace=1
+    swaymsg "[workspace=\"$workspace\"] floating disable" >/dev/null
+    swaymsg "workspace \"$workspace\"; layout splith" >/dev/null
+    echo "window-arrange: Sway fallback arranged workspace $workspace (horizontal tiling)"
+    exit 0
+  fi
+  echo "Missing: hyprctl (and no live Sway IPC session found)" >&2
+  exit 1
+fi
 need python3
 
 # After Hyprland autostart launches apps, wait until a stable set of mapped
