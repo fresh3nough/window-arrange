@@ -459,16 +459,16 @@ class TestPlanBounds(unittest.TestCase):
         ]
         plan = build_plan(
             [mon], clients, {"id": 1},
-            gap=12, outer=16, phone_w=360, phone_h=800, auto_adapt=False,
+            gap=12, outer=16, phone_w=800, phone_h=360, auto_adapt=False,
         )
         roles = {p["role"]: p for p in plan}
         self.assertIn("phone", roles)
         self.assertIn("grid", roles)
         phone = roles["phone"]
         grid = roles["grid"]
-        self.assertGreaterEqual(phone["w"], 240)
-        self.assertLessEqual(phone["w"], 360)
-        self.assertGreaterEqual(phone["h"] / max(phone["w"], 1), 1.7)
+        self.assertGreaterEqual(phone["w"], 480)
+        self.assertLessEqual(phone["w"], 800)
+        self.assertGreaterEqual(phone["w"] / max(phone["h"], 1), 1.5)
         self.assertGreater(phone["x"], grid["x"])
         self.assertEqual(phone["x"] + phone["w"], work_area(mon, 16)[2])
         self.assertLessEqual(grid["x"] + grid["w"], phone["x"])

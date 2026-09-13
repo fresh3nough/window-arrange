@@ -7,7 +7,7 @@ Omarchy / Hyprland helper that tidies every window on the **active workspace**.
 - **Adaptive padding** — roomier gap/outer (~12/16 at reference density); override with env vars
 - **Even non-overlapping grid** — integer-split cells with true gutters; prefers browser-safe widths so min-size clamps cannot stack windows
 - **Toolkit-aware packing** — Chromium (~500w) / Goose (~480×400) force stacks + floor-aware heights; 1Password (~784w) gets a dedicated right strip so 5–7 apps never cut off; settle pins oversize clamps inside work bounds
-- **scrcpy / Pixel** stays a compact portrait strip on the right
+- **scrcpy / Pixel** stays a compact landscape strip on the right
 - **Interactive edit** — drag windows to swap cells; drag edges/corners to resize and push neighbors (i3-style gutters stay put)
 - **Auto on open** — every new mapped app window triggers a debounced arrange (`hl.on("window.open")`)
 - Works with Hyprland 0.56+ Lua dispatchers (`hl.dsp.window.*`)

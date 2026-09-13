@@ -8,7 +8,7 @@
 #
 # Omarchy-style layout (not fullscreen / not edge-to-edge chrome):
 #   - Exit fullscreen / maximized so the top bar + wallpaper stay visible
-#   - Integer-split grid with gutters; scrcpy/Pixel → right portrait strip
+#   - Integer-split grid with gutters; scrcpy/Pixel → right landscape strip
 #   - Strip Omarchy `floating-window*` size/center tags that would fight us
 #   - float { action = "enable" } (bare float toggles and tiles 1Password)
 #
@@ -25,8 +25,8 @@
 # Env knobs (all optional; unset = adaptive from logical work area):
 #   WINDOW_ARRANGE_GAP=12
 #   WINDOW_ARRANGE_OUTER=16
-#   WINDOW_ARRANGE_PHONE_W=360
-#   WINDOW_ARRANGE_PHONE_H=800
+#   WINDOW_ARRANGE_PHONE_W=800
+#   WINDOW_ARRANGE_PHONE_H=360
 #   WINDOW_ARRANGE_ADAPT=1          # 0 = fixed defaults above, still logical geometry
 #   WINDOW_ARRANGE_NOTIFY=1         # 0 = silence toast (boot / auto-open)
 #   WINDOW_ARRANGE_ON_START_WAIT=8  # seconds --on-start will poll for windows

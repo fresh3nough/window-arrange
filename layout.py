@@ -175,8 +175,9 @@ def adaptive_defaults(area_w: int, area_h: int) -> dict[str, int]:
     # Roomier gutters: gap ~12, outer ~16 at reference density.
     gap = max(8, int(round(12 * factor)))
     outer = max(10, int(round(16 * factor)))
-    phone_w = max(240, min(420, int(round(area_w * 0.25))))
-    phone_h = max(480, min(area_h, int(round(phone_w * 2.1))))
+    # Landscape strip (~20:9 Pixel ratio), capped so the grid keeps room.
+    phone_w = max(480, min(960, int(round(area_w * 0.40))))
+    phone_h = max(216, min(area_h, int(round(phone_w * 9 / 20))))
     return {"gap": gap, "outer": outer, "phone_w": phone_w, "phone_h": phone_h}
 
 
@@ -1099,7 +1100,7 @@ def build_plan(
     probe_outer = 16 if outer is None else outer
     _x0, _y0, _x1, _y1, area_w, area_h = work_area(mon, probe_outer)
     derived = adaptive_defaults(area_w, area_h) if auto_adapt else {
-        "gap": 12, "outer": 16, "phone_w": 360, "phone_h": 800,
+        "gap": 12, "outer": 16, "phone_w": 800, "phone_h": 360,
     }
 
     gap_i = int(gap if gap is not None else derived["gap"])
@@ -1142,10 +1143,11 @@ def build_plan(
 
     right_w = 0
     if phone:
-        pw = min(phone_w_i, max(240, area_w // 5))
+        # Landscape strip: wider than tall (~20:9), right-aligned.
+        pw = min(phone_w_i, max(480, area_w // 3))
         ph = min(phone_h_i, area_h)
-        if ph / max(pw, 1) < 1.7:
-            ph = min(area_h, int(pw * 2.1))
+        if pw / max(ph, 1) < 1.5:
+            ph = min(area_h, max(216, int(pw * 9 / 20)))
         px = x1 - pw
         py = y0 + max(0, (area_h - ph) // 2)
         plan.append(
