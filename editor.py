@@ -179,19 +179,22 @@ def _claim_single_instance() -> None:
 
 
 # Palette — translucent outlines over the real desktop (no white wash).
-COL_TILE_FILL = (0.18, 0.42, 0.78, 0.10)
-COL_TILE_BORDER = (0.55, 0.82, 1.0, 0.85)
-COL_ACTIVE_FILL = (0.95, 0.70, 0.20, 0.16)
-COL_ACTIVE_BORDER = (1.0, 0.85, 0.35, 1.0)
+# Gold focus glow matches the persistent Hyprland active border/glow.
+COL_TILE_FILL = (0.55, 0.42, 0.12, 0.08)
+COL_TILE_BORDER = (0.85, 0.70, 0.30, 0.55)
+COL_ACTIVE_FILL = (1.0, 0.84, 0.20, 0.18)
+COL_ACTIVE_BORDER = (1.0, 0.84, 0.0, 1.0)
+COL_ACTIVE_GLOW = (1.0, 0.72, 0.20, 0.35)
 COL_SWAP_FILL = (0.25, 0.80, 0.45, 0.18)
 COL_SWAP_BORDER = (0.45, 1.0, 0.60, 1.0)
-COL_HOVER_FILL = (0.30, 0.55, 0.90, 0.14)
-COL_HANDLE = (1.0, 1.0, 1.0, 0.90)
-COL_TEXT = (1.0, 1.0, 1.0, 0.95)
-COL_TEXT_SHADOW = (0.0, 0.0, 0.0, 0.55)
-COL_HINT_BG = (0.06, 0.07, 0.10, 0.78)
-COL_GHOST = (1.0, 1.0, 1.0, 0.12)
-COL_WORKAREA = (1.0, 1.0, 1.0, 0.14)
+COL_HOVER_FILL = (1.0, 0.82, 0.35, 0.14)
+COL_HOVER_BORDER = (1.0, 0.88, 0.45, 0.90)
+COL_HANDLE = (1.0, 0.95, 0.75, 0.95)
+COL_TEXT = (1.0, 0.96, 0.85, 0.96)
+COL_TEXT_SHADOW = (0.15, 0.10, 0.0, 0.60)
+COL_HINT_BG = (0.10, 0.08, 0.04, 0.82)
+COL_GHOST = (1.0, 0.85, 0.35, 0.14)
+COL_WORKAREA = (1.0, 0.84, 0.30, 0.22)
 
 # Live-apply throttle while dragging (ms). Hyprland eval is ~5–20ms.
 LIVE_APPLY_MS = 16
@@ -614,8 +617,14 @@ class ArrangeCanvas(Gtk.DrawingArea):
             cr.set_source_rgba(*COL_GHOST)
             self._round_rect(cr, rx, ry, src["w"], src["h"], 10)
             cr.fill()
+            # Soft gold halo on the drag ghost.
+            r, g, b, a = COL_ACTIVE_GLOW
+            cr.set_source_rgba(r, g, b, a * 0.55)
+            cr.set_line_width(6)
+            self._round_rect(cr, rx, ry, src["w"], src["h"], 10)
+            cr.stroke()
             cr.set_source_rgba(*COL_ACTIVE_BORDER)
-            cr.set_line_width(2)
+            cr.set_line_width(2.5)
             self._round_rect(cr, rx, ry, src["w"], src["h"], 10)
             cr.stroke()
 
@@ -629,20 +638,35 @@ class ArrangeCanvas(Gtk.DrawingArea):
 
         if is_swap:
             fill, border = COL_SWAP_FILL, COL_SWAP_BORDER
+            glow = False
         elif is_drag and self._drag_handle != "body":
             fill, border = COL_ACTIVE_FILL, COL_ACTIVE_BORDER
+            glow = True
         elif is_drag and self._drag_handle == "body":
-            fill, border = (0.22, 0.45, 0.78, 0.06), (0.55, 0.78, 1.0, 0.40)
+            fill, border = (0.55, 0.42, 0.12, 0.06), (0.85, 0.70, 0.30, 0.40)
+            glow = False
         elif is_hover:
-            fill, border = COL_HOVER_FILL, COL_TILE_BORDER
+            fill, border = COL_HOVER_FILL, COL_HOVER_BORDER
+            glow = True
         else:
             fill, border = COL_TILE_FILL, COL_TILE_BORDER
+            glow = False
 
         cr.set_source_rgba(*fill)
         self._round_rect(cr, lx, ly, lw, lh, 10)
         cr.fill()
+
+        # Soft outer gold halo (matches Hyprland decoration.glow on focus).
+        if glow:
+            for width, alpha_scale in ((10.0, 0.18), (6.0, 0.30), (3.5, 0.55)):
+                r, g, b, a = COL_ACTIVE_GLOW
+                cr.set_source_rgba(r, g, b, a * alpha_scale / 0.35)
+                cr.set_line_width(width)
+                self._round_rect(cr, lx, ly, lw, lh, 10)
+                cr.stroke()
+
         cr.set_source_rgba(*border)
-        cr.set_line_width(2.5 if (is_drag or is_swap or is_hover) else 1.5)
+        cr.set_line_width(3.0 if (is_drag or is_swap or is_hover) else 1.5)
         self._round_rect(cr, lx, ly, lw, lh, 10)
         cr.stroke()
 

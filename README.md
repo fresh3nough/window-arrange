@@ -10,6 +10,7 @@ Omarchy / Hyprland helper that tidies every window on the **active workspace**.
 - **scrcpy / Pixel** stays a compact landscape strip on the right
 - **Interactive edit** — drag windows to swap cells; drag edges/corners to resize and push neighbors (i3-style gutters stay put)
 - **Auto on open** — every new mapped app window triggers a debounced arrange (`hl.on("window.open")`)
+- **Gold focus glow** — persistent multi-stop gold active border + outer `decoration.glow` halo on the focused window (installed into `~/.config/hypr/looknfeel.lua`)
 - Works with Hyprland 0.56+ Lua dispatchers (`hl.dsp.window.*`)
 
 ## Install (other Omarchy machine)
@@ -22,7 +23,7 @@ cd window-arrange
 bash install.sh
 ```
 
-`install.sh` puts the binary and modules on `~/.local/bin` (and a copy under `~/.local/share/window-arrange`), rebinds **Super+J** (replaces dwindle togglesplit), binds **Super+B** for the interactive editor, binds **Super+Alt+A**, installs **`~/.config/hypr/window-arrange-hook.lua`** so every new app window auto-arranges, and hooks **`window-arrange --on-start`** into `~/.config/hypr/autostart.lua` so the grid also runs after autoload apps map.
+`install.sh` puts the binary and modules on `~/.local/bin` (and a copy under `~/.local/share/window-arrange`), rebinds **Super+J** (replaces dwindle togglesplit), binds **Super+B** for the interactive editor, binds **Super+Alt+A**, installs **`~/.config/hypr/window-arrange-hook.lua`** so every new app window auto-arranges, hooks **`window-arrange --on-start`** into `~/.config/hypr/autostart.lua` so the grid also runs after autoload apps map, and writes the **glowing gold focus outline** into `~/.config/hypr/looknfeel.lua` (multi-stop gold `col.active_border` + `decoration.glow`, with looping `borderangle` / `glowangle` so the gradient keeps drifting while focused). Theme border colors lose to this user looknfeel block because it loads after `omarchy.current.theme.hyprland`.
 
 Why Super+J: default Omarchy `togglesplit` only flips already-tiled dwindle leaves. Floated / popped / maximized windows ignore it and keep stacking — the usual ultrawide / Surface Book mess. Arrange always re-packs the free work area as a responsive grid instead.
 

@@ -30,6 +30,42 @@ mkdir -p "$(dirname "$HOOK_DST")"
 install -m 0644 "$HOOK_SRC" "$HOOK_DST"
 install -m 0644 "$HOOK_SRC" "${SHARE_DIR}/window-arrange-hook.lua"
 
+# Gold focus outline: glowing gold border + outer glow on the focused window.
+# Persists in ~/.config/hypr/looknfeel.lua (loaded after Omarchy defaults + theme).
+GOLD_SRC="${ROOT}/looknfeel-gold-focus.lua"
+GOLD_SHARE="${SHARE_DIR}/looknfeel-gold-focus.lua"
+if [ -f "$GOLD_SRC" ]; then
+  install -m 0644 "$GOLD_SRC" "$GOLD_SHARE"
+  LOOK_FILE="${HOME}/.config/hypr/looknfeel.lua"
+  mkdir -p "$(dirname "$LOOK_FILE")"
+  if [ ! -f "$LOOK_FILE" ]; then
+    cat > "$LOOK_FILE" <<'LUA'
+-- Change the default Omarchy look'n'feel.
+LUA
+  fi
+  tmp="$(mktemp)"
+  awk '
+    BEGIN { skip=0 }
+    /^-- window-arrange:gold-focus-begin$/ { skip=1; next }
+    /^-- window-arrange:gold-focus-end$/ { skip=0; next }
+    skip==0 { print }
+  ' "$LOOK_FILE" > "$tmp"
+  {
+    cat "$tmp"
+    echo ""
+    echo "-- window-arrange:gold-focus-begin"
+    # Strip leading file header comments from the module (keep body).
+    awk '
+      BEGIN { started=0 }
+      /^local active_border_color/ { started=1 }
+      started { print }
+    ' "$GOLD_SRC"
+    echo "-- window-arrange:gold-focus-end"
+  } > "${tmp}.out"
+  mv "${tmp}.out" "$LOOK_FILE"
+  rm -f "$tmp"
+fi
+
 # Ensure ~/.local/bin is on PATH for this shell and future logins
 case ":${PATH}:" in
   *":${BIN_DIR}:"*) ;;
@@ -116,6 +152,7 @@ fi
 echo "Installed: ${BIN_DIR}/window-arrange"
 echo "Modules:   ${SHARE_DIR}/{layout,geometry,apply,editor}.py"
 echo "Hook:      ${HOOK_DST}  (hl.on window.open → arrange)"
+echo "Focus:     glowing gold outline  (via ~/.config/hypr/looknfeel.lua)"
 echo "Hotkeys:   Super+J / Super+Alt+A arrange · Super+B edit"
 echo "Autostart: window-arrange --on-start  (via ~/.config/hypr/autostart.lua)"
 echo "Auto:      every new app window rearranges instantly"
