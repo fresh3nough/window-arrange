@@ -1,5 +1,7 @@
 # window-arrange
 
+![window-arrange screenshot](screenshot.png)
+
 Omarchy / Hyprland helper that tidies every window on the **active workspace**.
 
 - **Not fullscreen** — exits maximized/fullscreen first so the Omarchy top bar (clock, shortcuts) and desktop wallpaper stay visible
