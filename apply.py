@@ -665,10 +665,17 @@ def snapshot_workspace_windows() -> list[dict[str, Any]]:
     clients = load_json(["hyprctl", "clients", "-j"])
     ws_id = active.get("id")
     wins: list[dict[str, Any]] = []
+    # Editor mins must be *toolkit floors only* — never Super+B preferred sizes.
+    # Preferred sizes (e.g. Brave 1112w) are launch/arrange floors; if they were
+    # baked into min_w here, Super+B sideways shrink would freeze at 1112 and
+    # feel like edges "don't work".
     try:
-        from layout import toolkit_min_size
+        from layout import toolkit_floor_size as _floor_size
     except Exception:
-        toolkit_min_size = None
+        try:
+            from layout import _toolkit_floor_size as _floor_size  # type: ignore
+        except Exception:
+            _floor_size = None  # type: ignore
     for c in clients:
         if not c.get("mapped") or c.get("hidden"):
             continue
@@ -683,9 +690,9 @@ def snapshot_workspace_windows() -> list[dict[str, Any]]:
         at = c.get("at") or [0, 0]
         size = c.get("size") or [100, 100]
         _mw = _mh = None
-        if toolkit_min_size is not None:
+        if _floor_size is not None:
             try:
-                _mw, _mh = toolkit_min_size(c)
+                _mw, _mh = _floor_size(c)
             except Exception:
                 pass
         wins.append(
@@ -702,7 +709,9 @@ def snapshot_workspace_windows() -> list[dict[str, Any]]:
                 "pinned": bool(c.get("pinned")),
                 # Per-window toolkit minimums let the editor refuse resizes that
                 # would shrink a toolkit-clamped app (Chromium ~500w) below its
-                # floor and overlap its live-clamped neighbor.
+                # floor and overlap its live-clamped neighbor. Preferred Super+B
+                # sizes are intentionally NOT included — user must be able to
+                # shrink below a previous preferred to set a new one.
                 "min_w": int(_mw) if _mw else 0,
                 "min_h": int(_mh) if _mh else 0,
                 "role": "phone"

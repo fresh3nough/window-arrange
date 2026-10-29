@@ -351,44 +351,43 @@ class TestRowBands(unittest.TestCase):
         self.assertEqual(bands[0], [0, 1])  # top L→R
         self.assertEqual(bands[1], [2])     # bottom
 
-    def test_drop_bottom_onto_top_flips_rows(self):
-        # Drag C onto A → C takes the top frame full-width; A+B split the bottom.
+    def test_drop_bottom_onto_top_swaps_pair_geometry(self):
+        # Drag C onto A → C takes A's exact spot+size; A takes C's; B stays.
         out = rearrange_drop(
             self.wins, 2, 0, gap=self.gap, min_w=40, min_h=40, bounds=self.bounds
         )
         self.assertFalse(any_overlaps(out))
         self.assertTrue(layout_is_valid(out, self.bounds, min_w=40, min_h=40))
-        # C should now sit in the old top frame (y=0, full width ~512, h=200)
-        c = out[2]
-        self.assertEqual(c["y"], 0)
-        self.assertEqual(c["h"], 200)
-        self.assertEqual(c["x"], 0)
-        self.assertEqual(c["w"], 512)
-        # A and B share the old bottom frame
-        a, b = out[0], out[1]
-        self.assertEqual(a["y"], 212)
-        self.assertEqual(b["y"], 212)
-        self.assertEqual(a["h"], 212)
-        self.assertEqual(b["h"], 212)
-        self.assertLess(a["x"], b["x"])
-        # They split the 512px width with a gap
-        self.assertEqual(a["x"] + a["w"] + self.gap, b["x"])
-        self.assertEqual(b["x"] + b["w"], 512)
+        # Pairwise swap only — C has A's old geometry, A has C's.
+        self.assertEqual(
+            (out[2]["x"], out[2]["y"], out[2]["w"], out[2]["h"]), (0, 0, 250, 200)
+        )
+        self.assertEqual(
+            (out[0]["x"], out[0]["y"], out[0]["w"], out[0]["h"]), (0, 212, 512, 212)
+        )
+        # B untouched.
+        self.assertEqual(
+            (out[1]["x"], out[1]["y"], out[1]["w"], out[1]["h"]), (262, 0, 250, 200)
+        )
 
-    def test_drop_top_onto_bottom_flips_rows(self):
-        # Drag A onto C — same band flip (pair goes down, C goes up).
+    def test_drop_top_onto_bottom_swaps_pair_geometry(self):
+        # Drag A onto C — pairwise swap of spot+size; B stays put.
         out = rearrange_drop(
             self.wins, 0, 2, gap=self.gap, min_w=40, min_h=40, bounds=self.bounds
         )
         self.assertFalse(any_overlaps(out))
-        c = out[2]
-        self.assertEqual(c["y"], 0)
-        self.assertEqual(c["w"], 512)
-        self.assertEqual(out[0]["y"], 212)
-        self.assertEqual(out[1]["y"], 212)
+        self.assertEqual(
+            (out[0]["x"], out[0]["y"], out[0]["w"], out[0]["h"]), (0, 212, 512, 212)
+        )
+        self.assertEqual(
+            (out[2]["x"], out[2]["y"], out[2]["w"], out[2]["h"]), (0, 0, 250, 200)
+        )
+        self.assertEqual(
+            (out[1]["x"], out[1]["y"], out[1]["w"], out[1]["h"]), (262, 0, 250, 200)
+        )
 
     def test_drop_within_top_row_is_cell_swap(self):
-        # A onto B → only those two cells swap; C stays put.
+        # A onto B → only those two cells swap spot+size; C stays put.
         out = rearrange_drop(
             self.wins, 0, 1, gap=self.gap, min_w=40, min_h=40, bounds=self.bounds
         )
@@ -402,7 +401,8 @@ class TestRowBands(unittest.TestCase):
             (out[2]["x"], out[2]["y"], out[2]["w"], out[2]["h"]), (0, 212, 512, 212)
         )
 
-    def test_swap_bands_direct(self):
+    def test_swap_bands_direct_still_available(self):
+        # Low-level band helper remains for callers that want whole-row flips.
         out = swap_bands(
             self.wins, [0, 1], [2], gap=self.gap, min_w=40, min_h=40, bounds=self.bounds
         )
@@ -412,8 +412,8 @@ class TestRowBands(unittest.TestCase):
         self.assertEqual(out[1]["y"], 212)
         self.assertFalse(any_overlaps(out))
 
-    def test_three_plus_two_band_flip(self):
-        # Top 3 equal, bottom 2 equal — dropping any top onto any bottom flips.
+    def test_cross_row_drop_swaps_spot_and_size_only(self):
+        # Top 3 + bottom 2: drop one bottom onto one top → only those two swap.
         gap = 10
         wins = [
             tile(0, 0, 0, 180, 150),
@@ -427,14 +427,19 @@ class TestRowBands(unittest.TestCase):
         self.assertEqual(bands, [[0, 1, 2], [3, 4]])
         out = rearrange_drop(wins, 4, 1, gap=gap, min_w=40, min_h=40, bounds=bounds)
         self.assertFalse(any_overlaps(out))
-        # Bottom pair should now occupy the top frame
-        self.assertEqual(out[3]["y"], 0)
-        self.assertEqual(out[4]["y"], 0)
-        self.assertEqual(out[3]["h"], 150)
-        # Top trio should occupy the bottom frame
-        for i in (0, 1, 2):
-            self.assertEqual(out[i]["y"], 160)
-            self.assertEqual(out[i]["h"], 200)
+        # Window 4 takes window 1's geometry; window 1 takes window 4's.
+        self.assertEqual(
+            (out[4]["x"], out[4]["y"], out[4]["w"], out[4]["h"]), (190, 0, 180, 150)
+        )
+        self.assertEqual(
+            (out[1]["x"], out[1]["y"], out[1]["w"], out[1]["h"]), (285, 160, 275, 200)
+        )
+        # Everyone else stays put.
+        for i in (0, 2, 3):
+            self.assertEqual(
+                (out[i]["x"], out[i]["y"], out[i]["w"], out[i]["h"]),
+                (wins[i]["x"], wins[i]["y"], wins[i]["w"], wins[i]["h"]),
+            )
 
 
 class TestHitTest(unittest.TestCase):

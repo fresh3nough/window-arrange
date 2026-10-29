@@ -13,6 +13,11 @@ import unittest
 # Repo root on path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+# Isolate unit tests from the user's Super+B preferred-size store so packing
+# floors stay deterministic (otherwise a saved Brave 1112×620 inflates every
+# browser plan and breaks toolkit-floor assertions).
+os.environ["WINDOW_ARRANGE_SIZES_JSON"] = os.devnull
+
 from layout import (  # noqa: E402
     adaptive_defaults,
     build_plan,
@@ -20,11 +25,16 @@ from layout import (  # noqa: E402
     logical_monitor_box,
     pack_window_cells,
     place_grid,
+    preferred_size,
     rects_overlap,
+    reload_preferred_sizes,
     split_axis,
     toolkit_min_size,
     work_area,
 )
+
+# Force empty preferred cache after env override.
+reload_preferred_sizes()
 
 
 def mon_hidpi() -> dict:
@@ -503,6 +513,87 @@ class TestRegressionPhysicalVsLogical(unittest.TestCase):
         self.assertTrue(all(p["x"] < 1504 for p in plan))
         assert_no_plan_overlap(self, plan)
 
+
+
+
+class TestPreferredSizes(unittest.TestCase):
+    """Super+B preferred sizes are floors/weights; Super+J still fills the grid."""
+
+    def test_toolkit_min_includes_preferred(self):
+        from layout import toolkit_floor_size
+
+        c = fake_client("0x1", "brave-browser")
+        c["preferred_w"] = 1112
+        c["preferred_h"] = 620
+        self.assertEqual(toolkit_min_size(c), (1112, 620))
+        self.assertEqual(preferred_size(c), (1112, 620))
+        # Editor / snapshot floors stay at bare toolkit clamp so Super+B can
+        # shrink sideways below a previous preferred width.
+        self.assertEqual(toolkit_floor_size(c), (500, 120))
+        # Bare browser floor still used when no preferred.
+        bare = fake_client("0x2", "brave-browser")
+        self.assertEqual(toolkit_min_size(bare), (500, 120))
+        self.assertEqual(toolkit_floor_size(bare), (500, 120))
+
+    def test_build_plan_honors_preferred_floor_and_fills_grid(self):
+        mon = mon_hidpi()
+        clients = [
+            fake_client("0xa", "brave-browser", at=(0, 0), size=(800, 400)),
+            fake_client("0xb", "goose", at=(0, 0), size=(800, 400)),
+        ]
+        clients[0]["preferred_w"] = 900
+        clients[0]["preferred_h"] = 500
+        clients[1]["preferred_w"] = 700
+        clients[1]["preferred_h"] = 400
+        plan = build_plan(
+            [{**mon, "focused": True}],
+            clients,
+            {"id": 1, "name": "1"},
+            gap=12,
+            outer=16,
+            auto_adapt=False,
+        )
+        by_cls = {p["class"]: p for p in plan}
+        # Preferred is a floor — never crush below saved height.
+        self.assertGreaterEqual(by_cls["brave-browser"]["h"], 500)
+        self.assertGreaterEqual(by_cls["brave-browser"]["w"], 500)
+        self.assertEqual(by_cls["brave-browser"]["meta"].get("preferred"), [900, 500])
+        self.assertGreaterEqual(by_cls["goose"]["h"], 400)
+        # Super+J fills the work area (no huge gaps from exact preferred snap).
+        x0, y0, x1, y1, aw, ah = work_area(mon, 16)
+        covered_w = max(p["x"] + p["w"] for p in plan) - min(p["x"] for p in plan)
+        covered_h = max(p["y"] + p["h"] for p in plan) - min(p["y"] for p in plan)
+        # With 2 windows, cover nearly full work area (allow one gap strip).
+        self.assertGreaterEqual(covered_w, aw - 24)
+        self.assertGreaterEqual(covered_h, ah - 24)
+        cells = [(p["x"], p["y"], p["w"], p["h"]) for p in plan]
+        for i, a in enumerate(cells):
+            for b in cells[i + 1 :]:
+                self.assertFalse(rects_overlap(a, b), f"{a} vs {b}")
+
+    def test_solo_preferred_still_fills_work_area(self):
+        """Super+J solo window fills the work area; preferred is launch-only exact."""
+        mon = mon_hidpi()
+        clients = [
+            fake_client("0xa", "brave-browser", at=(0, 0), size=(800, 400)),
+        ]
+        clients[0]["preferred_w"] = 1112
+        clients[0]["preferred_h"] = 620
+        plan = build_plan(
+            [{**mon, "focused": True}],
+            clients,
+            {"id": 1},
+            gap=12,
+            outer=16,
+            auto_adapt=False,
+        )
+        self.assertEqual(len(plan), 1)
+        x0, y0, x1, y1, aw, ah = work_area(mon, 16)
+        # Full-bleed cell (outer padding only) — not the tiny preferred box.
+        self.assertGreaterEqual(plan[0]["w"], aw - 4)
+        self.assertGreaterEqual(plan[0]["h"], ah - 4)
+        self.assertGreaterEqual(plan[0]["w"], 1112)
+        self.assertGreaterEqual(plan[0]["h"], 620)
 
 if __name__ == "__main__":
     unittest.main()

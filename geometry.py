@@ -676,42 +676,22 @@ def rearrange_drop(
     min_h: int = DEFAULT_MIN_H,
     bounds: tuple[int, int, int, int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Body-drop rearrange: same-band → cell swap; cross-band → full band swap.
+    """Body-drop rearrange: swap the two windows' full geometry (spot + size).
 
-    Dropping any window from a multi-tile top row onto the full-width bottom
-    window (or the reverse) flips the two row frames so the pair moves down and
-    the single window moves up — the interaction the 1:1 geometry swap could
-    not express.
+    Dragging window A onto window B exchanges their x/y/w/h so each takes the
+    other's place *and* size. Identities (address/class) stay with the window.
+    Same-row and cross-row drops behave the same — always a pairwise swap.
+
+    ``gap`` / ``min_w`` / ``min_h`` / ``bounds`` are accepted for API stability
+    (callers + older band-flip path) but the pairwise swap does not redistribute
+    other windows.
     """
+    del gap, min_w, min_h, bounds  # API compat; pairwise swap only.
     out = clone_windows(windows)
     n = len(out)
     if src == dst or src < 0 or dst < 0 or src >= n or dst >= n:
         return out
-
-    bands = detect_row_bands(out)
-    band_of = [-1] * n
-    for bi, members in enumerate(bands):
-        for i in members:
-            band_of[i] = bi
-
-    bs, bd = band_of[src], band_of[dst]
-    if bs < 0 or bd < 0:
-        return swap_windows(out, src, dst)
-
-    if bs == bd:
-        # Same row: simple cell swap keeps the band's column structure.
-        return swap_windows(out, src, dst)
-
-    # Different rows: swap the entire bands' frames (handles 2-up ↔ 1-up).
-    return swap_bands(
-        out,
-        bands[bs],
-        bands[bd],
-        gap=gap,
-        min_w=min_w,
-        min_h=min_h,
-        bounds=bounds,
-    )
+    return swap_windows(out, src, dst)
 
 
 def _clamp_handle_px(

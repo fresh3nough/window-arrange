@@ -77,7 +77,10 @@ def wants_wide(c: dict[str, Any]) -> bool:
         # Electron shells on this HiDPI panel also refuse narrow frames.
         "goose", "electron", "slack", "discord", "code", "cursor", "1password",
     )
-    return any(n in cls or n in title for n in needles)
+    if any(n in cls or n in title for n in needles):
+        return True
+    pref = preferred_size(c)
+    return bool(pref and int(pref[0]) >= 480)
 
 
 def wants_tall(c: dict[str, Any]) -> bool:
@@ -90,7 +93,11 @@ def wants_tall(c: dict[str, Any]) -> bool:
         # GTK file manager hard-clamps ~380h on this panel.
         "nautilus",
     )
-    return any(n in cls or n in title for n in needles)
+    if any(n in cls or n in title for n in needles):
+        return True
+    # Super+B preferred tall sizes (e.g. Brave 620h) must pack as tall apps.
+    pref = preferred_size(c)
+    return bool(pref and int(pref[1]) >= 350)
 
 
 def is_hard_tall(c: dict[str, Any]) -> bool:
@@ -98,19 +105,25 @@ def is_hard_tall(c: dict[str, Any]) -> bool:
 
     Driven by observed min height only (Nautilus/Goose/1Password ≥350). VS Code
     ~312 is tall-weighted but not hard — treating it as hard left Nautilus in a
-    crushed leftover cell that clamped over neighbors.
+    crushed leftover cell that clamped over neighbors. Super+B preferred
+    heights ≥350 also count so a tall Brave is not crushed into a leftover.
     """
     _mw, mh = toolkit_min_size(c)
     return mh >= 350
 
 
-def toolkit_min_size(c: dict[str, Any]) -> tuple[int, int]:
-    """Observed Wayland min sizes on Omarchy HiDPI (logical px).
+def toolkit_floor_size(c: dict[str, Any]) -> tuple[int, int]:
+    """Hard Wayland toolkit floors only (no Super+B preferred sizes).
 
-    Clients silently refuse smaller resize requests and keep their min frame,
-    which shifts a center-anchored resize into neighboring cells. Planning at
-    or above these floors keeps top-left placement honest.
+    Used by the Super+B editor so resize mins stay at real toolkit clamps
+    (Brave ~500w, Goose ~480×400) and the user can shrink below a previously
+    saved preferred size to set a new one.
     """
+    return _toolkit_floor_size(c)
+
+
+def _toolkit_floor_size(c: dict[str, Any]) -> tuple[int, int]:
+    """Hard Wayland toolkit floors only (no Super+B preferred sizes)."""
     cls = (c.get("class") or "").lower()
     title = (c.get("title") or "").lower()
     # Browsers: hard min width ~500; height is flexible (~100 observed).
@@ -147,6 +160,87 @@ def toolkit_min_size(c: dict[str, Any]) -> tuple[int, int]:
     if "diskutility" in cls or "gnome-disks" in cls or "baobab" in cls:
         return 360, 120
     return 200, 100
+
+
+_PREFERRED_SIZES_CACHE: dict[str, dict[str, int]] | None = None
+_PREFERRED_SIZES_LOADED = False
+
+
+def _preferred_store() -> dict[str, dict[str, int]]:
+    """Lazy-load Super+B preferred sizes (empty if defaults.py missing)."""
+    global _PREFERRED_SIZES_CACHE, _PREFERRED_SIZES_LOADED
+    if _PREFERRED_SIZES_LOADED:
+        return _PREFERRED_SIZES_CACHE or {}
+    _PREFERRED_SIZES_LOADED = True
+    try:
+        from defaults import load_preferred_sizes  # noqa: WPS433
+
+        _PREFERRED_SIZES_CACHE = load_preferred_sizes()
+    except Exception:
+        _PREFERRED_SIZES_CACHE = {}
+    return _PREFERRED_SIZES_CACHE or {}
+
+
+def reload_preferred_sizes() -> dict[str, dict[str, int]]:
+    """Drop the preferred-size cache (tests / after Super+B Done)."""
+    global _PREFERRED_SIZES_CACHE, _PREFERRED_SIZES_LOADED
+    _PREFERRED_SIZES_CACHE = None
+    _PREFERRED_SIZES_LOADED = False
+    return _preferred_store()
+
+
+def preferred_size(c: dict[str, Any]) -> tuple[int, int] | None:
+    """Return Super+B saved (w, h) for this window class, if any."""
+    # Explicit fields win (editor / tests can inject preferred_w/h).
+    try:
+        pw = c.get("preferred_w")
+        ph = c.get("preferred_h")
+        if pw is not None and ph is not None:
+            w, h = int(pw), int(ph)
+            if w >= 80 and h >= 80:
+                return w, h
+    except (TypeError, ValueError):
+        pass
+    try:
+        from defaults import preferred_size_for  # noqa: WPS433
+
+        return preferred_size_for(c, _preferred_store())
+    except Exception:
+        cls = (c.get("class") or "").strip()
+        if not cls:
+            return None
+        store = _preferred_store()
+        hit = store.get(cls) or store.get(cls.lower())
+        if not hit:
+            low = cls.lower()
+            for k, v in store.items():
+                if k.lower() == low:
+                    hit = v
+                    break
+        if not hit:
+            return None
+        return int(hit["w"]), int(hit["h"])
+
+
+def toolkit_min_size(c: dict[str, Any]) -> tuple[int, int]:
+    """Planning floor: max(toolkit clamp, Super+B preferred size).
+
+    Clients silently refuse smaller resize requests and keep their min frame,
+    which shifts a center-anchored resize into neighboring cells. Planning at
+    or above these floors keeps top-left placement honest.
+
+    Super+B Done saves each class's last resized size. Super+J uses that as a
+    *minimum floor / weight* so a tall saved Brave is not crushed into a short
+    leftover — but cells still expand to fill the whole work area (no huge
+    gaps). Exact preferred size is for launch rules only, not Super+J snap.
+    """
+    floor_w, floor_h = _toolkit_floor_size(c)
+    pref = preferred_size(c)
+    if pref is None:
+        return floor_w, floor_h
+    pw, ph = pref
+    # Prefer the remembered size, but never undercut a hard toolkit clamp.
+    return max(floor_w, int(pw)), max(floor_h, int(ph))
 
 
 def min_cell_width_for(grid_w: int, gap: int) -> int:
@@ -760,9 +854,14 @@ def _group_cells_by_row(
 
 
 def _height_weight_for(win: dict[str, Any]) -> int:
-    """Vertical split weight so tall toolkit mins keep usable donors."""
+    """Vertical split weight so tall toolkit mins / Super+B prefs keep usable donors."""
     _mw, mh = toolkit_min_size(win)
     base = max(mh, 160)
+    pref = preferred_size(win)
+    if pref is not None:
+        # Prefer the remembered height strongly so Super+J restores Super+B sizes
+        # instead of equal-splitting a tall Brave with Goose into short leftovers.
+        base = max(base, int(pref[1]))
     if wants_tall(win):
         base = max(base, 400)
     if wants_wide(win) and not wants_tall(win):
@@ -771,9 +870,12 @@ def _height_weight_for(win: dict[str, Any]) -> int:
 
 
 def _width_weight_for(win: dict[str, Any]) -> int:
-    """Horizontal split weight so wide clamps (1Password ~784) keep a column."""
+    """Horizontal split weight so wide clamps / Super+B prefs keep a column."""
     mw, _mh = toolkit_min_size(win)
     base = max(mw, 200)
+    pref = preferred_size(win)
+    if pref is not None:
+        base = max(base, int(pref[0]))
     if wants_wide(win):
         base = max(base, mw, 500)
     return base
@@ -904,9 +1006,14 @@ def _oversized_width_clamps(
 
 
 def _height_floor_for(win: dict[str, Any]) -> int:
-    """Absolute min height we try to plan for this window."""
+    """Absolute min height we try to plan for this window.
+
+    Includes Super+B preferred height so arrange never packs a remembered
+    tall app into a leftover stub cell.
+    """
     _mw, mh = toolkit_min_size(win)
-    # Always honor the observed toolkit min (Code ~312, Nautilus ~380).
+    # Always honor the observed toolkit min (Code ~312, Nautilus ~380)
+    # and any Super+B preferred size folded into toolkit_min_size.
     return max(int(mh), 80)
 
 
@@ -1183,6 +1290,10 @@ def build_plan(
     n = len(others)
 
     if n > 0:
+        # Super+J always fills the work area (gap gutters only — no huge
+        # empty bands). Super+B preferred sizes act as packing floors/weights
+        # via toolkit_min_size so a tall saved Brave is not crushed, but cells
+        # still expand to cover the grid.
         pairs = pack_window_cells(others, grid_x0, grid_y0, grid_w, grid_h, gap_i)
         cols, rows = choose_grid(n, grid_w, grid_h, gap_i)
         # Reflect stack mode in meta when densest uniform cell would be too narrow.
@@ -1192,6 +1303,22 @@ def build_plan(
             cols, rows = 2, max(1, (n + 1) // 2)
         for c, (cx, cy, cell_w, cell_h) in pairs:
             mw, mh = toolkit_min_size(c)
+            floor_w, floor_h = _toolkit_floor_size(c)
+            pref = preferred_size(c)
+            meta = {
+                "gap": gap_i,
+                "outer": outer_i,
+                "cols": cols,
+                "rows": rows,
+                "logical": list(logical_monitor_box(mon)[2:4]),
+                "toolkit_min": [int(floor_w), int(floor_h)],
+                "bound_x0": int(x0),
+                "bound_y0": int(y0),
+                "bound_x1": int(x1),
+                "bound_y1": int(y1),
+            }
+            if pref is not None:
+                meta["preferred"] = [int(pref[0]), int(pref[1])]
             plan.append(
                 {
                     "address": c["address"],
@@ -1207,18 +1334,7 @@ def build_plan(
                     "pinned": bool(c.get("pinned")),
                     "min_w": int(mw),
                     "min_h": int(mh),
-                    "meta": {
-                        "gap": gap_i,
-                        "outer": outer_i,
-                        "cols": cols,
-                        "rows": rows,
-                        "logical": list(logical_monitor_box(mon)[2:4]),
-                        "toolkit_min": [int(mw), int(mh)],
-                        "bound_x0": int(x0),
-                        "bound_y0": int(y0),
-                        "bound_x1": int(x1),
-                        "bound_y1": int(y1),
-                    },
+                    "meta": meta,
                 }
             )
 
@@ -1236,6 +1352,12 @@ def plan_from_hypr(
     phone_h: int | None = None,
     auto_adapt: bool = True,
 ) -> list[dict[str, Any]]:
+    # Always re-read Super+B preferred sizes so Super+J / auto-open pick up
+    # the latest Done without requiring a process restart.
+    try:
+        reload_preferred_sizes()
+    except Exception:
+        pass
     monitors = load_json(["hyprctl", "monitors", "-j"])
     clients = load_json(["hyprctl", "clients", "-j"])
     active = load_json(["hyprctl", "activeworkspace", "-j"])

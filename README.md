@@ -11,6 +11,7 @@ Omarchy / Hyprland helper that tidies every window on the **active workspace**.
 - **Toolkit-aware packing** — Chromium (~500w) / Goose (~480×400) force stacks + floor-aware heights; 1Password (~784w) gets a dedicated right strip so 5–7 apps never cut off; settle pins oversize clamps inside work bounds
 - **scrcpy / Pixel** stays a compact landscape strip on the right
 - **Interactive edit** — drag windows to swap cells; drag edges/corners to resize and push neighbors (i3-style gutters stay put)
+- **Remembered launch sizes** — Super+B Done saves each resized app's last size as its system default (`~/.config/window-arrange/preferred-sizes.json` + Hyprland `o.window` size rules), so apps reopen at the size you left them
 - **Auto on open** — every new mapped app window triggers a debounced arrange (`hl.on("window.open")`)
 - **Gold focus glow** — persistent multi-stop gold active border + outer `decoration.glow` halo on the focused window (installed into `~/.config/hypr/looknfeel.lua`)
 - Works with Hyprland 0.56+ Lua dispatchers (`hl.dsp.window.*`)
@@ -86,12 +87,16 @@ window-arrange --on-start   # wait for autostart apps, then arrange once
 
 **Single-instance:** only one editor may run. A second Super+B / `--edit` replaces the previous overlay (SIGTERM → SIGKILL) under an exclusive flock. Gtk.Application also uses `ALLOW_REPLACEMENT|REPLACE`. This prevents stacked overlays from pegging CPU (~90% each). Set `WINDOW_ARRANGE_EDITOR_REPLACE=0` to refuse a second launch instead.
 
-- **Drag a window's body** onto another window → **swap** cells in the same row, or **flip whole rows** when dropping across bands (e.g. 2-up top ↔ full-width bottom)
+- **Drag a window's body** onto another window → **swap spot and size** with that window (pairwise geometry exchange; identities stay with each app)
 - **Drag an edge or corner** → grow/shrink that side; **abutting neighbors move with it** and real windows **resize live under the outline** (no white wash, no wait-for-Apply)
 - Free-edge growth stops at non-neighbor obstacles and the work-area bound — cells never overlap
-- **Enter** / **Done** keeps the live layout and closes
-- **Esc** / **Cancel** / right-click **restores** the snapshot from when the editor opened
+- **Enter** / **Done** keeps the live layout, **saves any resized class sizes as launch defaults**, and closes
+- **Esc** / **Cancel** / right-click **restores** the snapshot from when the editor opened (no size save)
 - **R** re-reads live window geometries
+
+Saved sizes live in `~/.config/window-arrange/preferred-sizes.json` and are mirrored to `~/.config/hypr/window-arrange-sizes.lua` (required from `hyprland.lua`, with `float + size` so Chromium/Brave tile rules cannot discard them). Only classes whose size actually changed vs the editor-open snapshot are updated — pure swaps do not clobber a remembered size. Desktop chrome (`org.quickshell`, `owl:*` titles) is skipped.
+
+**Super+J / auto-arrange** still fill the whole work area (normal gutters only). Preferred sizes are packing *floors/weights* so a tall saved Brave is not crushed into a leftover strip — they are not exact snap targets (that left huge gaps). Exact preferred size applies on app launch via the Hyprland size rule.
 
 Requires `gtk4` + `gtk4-layer-shell` + `python-gobject`. On Arch/Omarchy: `sudo pacman -S gtk4-layer-shell`.
 
@@ -121,7 +126,7 @@ WINDOW_ARRANGE_ON_START_WAIT=12 window-arrange --on-start
 ## Tests
 
 ```bash
-python3 -m unittest tests.test_layout tests.test_geometry -v
+python3 -m unittest tests.test_layout tests.test_geometry tests.test_defaults -v
 ```
 
 Coverage includes HiDPI fractional scale (physical 2256x1504 @ 1.5667 → logical 1440x960) and scale-1.0 Mac-like canvases so placements stay on-screen on both.

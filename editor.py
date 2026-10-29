@@ -4,11 +4,12 @@
 GTK4 + gtk4-layer-shell overlay on the focused monitor:
 
   - Transparent chrome — desktop and live windows stay visible underneath
-  - Drag a window body onto another → swap their cells (applied live)
+  - Drag a window body onto another → swap their spot and size (applied live)
   - Drag edges / corners → resize, pushing abutting neighbors; applied live
     so real windows move under the outline in real time
-  - Enter / click Done → quit keeping the live layout
-  - Esc / click Cancel → restore the snapshot taken at editor open
+  - Enter / click Done → quit keeping the live layout and save any resized
+    class sizes as Hyprland launch defaults (so apps reopen at that size)
+  - Esc / click Cancel → restore the snapshot taken at editor open (no save)
   - R → re-snapshot live window positions
 
 Single-instance: Gtk.Application id + ALLOW_REPLACEMENT/REPLACE so a second
@@ -58,6 +59,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from apply import apply_plan, focused_monitor, snapshot_workspace_windows  # noqa: E402
+from defaults import persist_resized_defaults  # noqa: E402
 from geometry import (  # noqa: E402
     DEFAULT_GAP,
     DEFAULT_MIN_H,
@@ -65,7 +67,6 @@ from geometry import (  # noqa: E402
     HANDLE_PX,
     clone_windows,
     cursor_for_handle,
-    detect_row_bands,
     hit_test_handle,
     layout_is_valid,
     rearrange_drop,
@@ -543,23 +544,11 @@ class ArrangeCanvas(Gtk.DrawingArea):
         self.queue_draw()
 
     def _band_mates(self, src: int | None, dst: int | None) -> list[int]:
-        """Indices to highlight on drop preview (whole destination band if cross-row)."""
-        if src is None or dst is None:
+        """Indices to highlight on drop preview (the swap target window only)."""
+        if src is None or dst is None or src == dst:
             return []
-        bands = detect_row_bands(self.windows)
-        band_of = {}
-        for bi, members in enumerate(bands):
-            for i in members:
-                band_of[i] = bi
-        bs, bd = band_of.get(src, -1), band_of.get(dst, -1)
-        if bs < 0 or bd < 0:
-            return [dst]
-        if bs == bd:
-            return [dst]
-        # Cross-band: highlight every window in the destination band (and
-        # lightly the rest of the source band so the flip reads clearly).
-        mates = list(bands[bd]) + [i for i in bands[bs] if i != src]
-        return mates
+        # Pairwise spot+size swap — only the destination window is highlighted.
+        return [dst]
 
     def _reset_drag(self) -> None:
         self._drag_index = None
@@ -859,16 +848,50 @@ class EditorApp:
             # Layout is already live-applied during drag; one final commit.
             if self._canvas is not None:
                 result = self._canvas._apply_now(windows)
+                initial = self._canvas.initial_windows
             else:
                 result = apply_plan(
                     _plan_from_windows(windows), settle_retry=False
                 )
+                initial = None
             if result.get("error"):
                 print(f"apply_error={result['error']}", file=sys.stderr)
                 self._exit_code = 1
             else:
                 print(f"applied={result.get('count', len(windows))} ms={result.get('ms', 0):.0f}")
                 self._exit_code = 0
+                # Remember last Super+B size per class as the system launch default
+                # so apps reopen at the size you left them (no re-resize every time).
+                try:
+                    saved = persist_resized_defaults(
+                        windows,
+                        initial=initial,
+                        only_changed=True,
+                        apply_live=True,
+                        ensure_require=True,
+                    )
+                    n = int(saved.get("count") or 0)
+                    if n:
+                        print(
+                            f"defaults_saved={n} "
+                            f"json={saved.get('json', '')} "
+                            f"lua={saved.get('lua', '')}"
+                        )
+                    if saved.get("error"):
+                        print(
+                            f"defaults_warn={saved['error']}",
+                            file=sys.stderr,
+                        )
+                    # Drop layout preferred-size cache so a later in-process
+                    # arrange (rare) sees the just-saved sizes.
+                    try:
+                        from layout import reload_preferred_sizes
+
+                        reload_preferred_sizes()
+                    except Exception:
+                        pass
+                except Exception as exc:  # noqa: BLE001 — never fail Done on persist
+                    print(f"defaults_error={exc}", file=sys.stderr)
             self._loop.quit()
             win.destroy()
 
