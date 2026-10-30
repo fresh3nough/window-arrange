@@ -159,6 +159,13 @@ def _toolkit_floor_size(c: dict[str, Any]) -> tuple[int, int]:
     # Disks / baobab: width floor ~360; height is flexible (~100 observed).
     if "diskutility" in cls or "gnome-disks" in cls or "baobab" in cls:
         return 360, 120
+    # OWL desktop tiles (quickshell): compact floor for expanded keep-set.
+    if (
+        "quickshell" in cls
+        or title.startswith("owl:")
+        or title.startswith("owl ")
+    ):
+        return 160, 100
     return 200, 100
 
 
